@@ -115,7 +115,7 @@ jobs:
           projectPath: hoverai-desktop
           tagName:     ${{ github.ref_name }}
           releaseName: 'HoverAI ${{ github.ref_name }}'
-          releaseBody: 'See CHANGELOG for details.'
+          releaseBody: 'See [CHANGELOG](https://github.com/${{ github.repository }}/blob/main/hoverai-desktop/CHANGELOG.md) for full release notes.'
           releaseDraft: true          # creates a draft — you publish manually after review
           prerelease:   false
           args:         --target ${{ matrix.target }}
