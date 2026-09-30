@@ -189,6 +189,10 @@ export function onWakeWordError(cb: (message: string) => void): () => void {
 
 // ─── Overlay controls ────────────────────────────────────────────────────────
 
+export function setCursorPassthrough(passthrough: boolean): void {
+  invoke('set_cursor_passthrough', { passthrough }).catch(console.error)
+}
+
 export function focusOverlay(): void {
   invoke('focus_overlay').catch(console.error)
 }
@@ -247,6 +251,7 @@ const tauriApi = {
   onQueryResult,
   onQueryError,
   onWakeWordError,
+  setCursorPassthrough,
   focusOverlay,
   dismissOverlay,
   closeSettingsWindow,

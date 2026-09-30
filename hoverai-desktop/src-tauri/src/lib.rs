@@ -205,9 +205,12 @@ async fn run_query_pipeline(app: AppHandle, audio_data: Vec<u8>, screenshot_data
         Ok(resp) if resp.status().is_success() => {
             match resp.json::<QueryResponse>().await {
                 Ok(query_resp) => {
-                    // Show overlay as interactive (non-focusable so target app keeps focus)
+                    // Show overlay in pass-through mode — the renderer uses
+                    // set_cursor_passthrough to toggle hit-testing as the cursor
+                    // enters/leaves the panel, so clicks outside the panel reach
+                    // the underlying application windows.
                     if let Some(overlay) = get_overlay(&app) {
-                        let _ = overlay.set_ignore_cursor_events(false);
+                        let _ = overlay.set_ignore_cursor_events(true);
                         let _ = overlay.show();
                     }
                     let _ = app.emit_to("overlay", "query-result", &query_resp);
@@ -236,7 +239,8 @@ async fn run_query_pipeline(app: AppHandle, audio_data: Vec<u8>, screenshot_data
 
 fn show_overlay_for_error(app: &AppHandle) {
     if let Some(overlay) = get_overlay(app) {
-        let _ = overlay.set_ignore_cursor_events(false);
+        // Same pass-through default as query-result
+        let _ = overlay.set_ignore_cursor_events(true);
         let _ = overlay.show();
     }
 }
@@ -495,6 +499,16 @@ fn register_shortcut_from_settings(app: AppHandle, key: String) -> bool {
 
 // ── Overlay lifecycle ──
 
+/// Called by the renderer when the cursor enters/leaves a clickable panel.
+/// `passthrough = true`  → OS forwards all clicks to windows underneath.
+/// `passthrough = false` → OS routes clicks to this overlay (panel is active).
+#[tauri::command]
+fn set_cursor_passthrough(app: AppHandle, passthrough: bool) {
+    if let Some(overlay) = get_overlay(&app) {
+        let _ = overlay.set_ignore_cursor_events(passthrough);
+    }
+}
+
 #[tauri::command]
 async fn focus_overlay(app: AppHandle) {
     if let Some(overlay) = get_overlay(&app) {
@@ -670,6 +684,7 @@ pub fn run() {
             register_shortcut,
             register_shortcut_from_settings,
             // Overlay
+            set_cursor_passthrough,
             focus_overlay,
             dismiss_overlay,
             move_overlay,

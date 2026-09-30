@@ -87,8 +87,11 @@ export default function OverlayWidget() {
   const dismiss = useCallback(() => {
     setState({ kind: 'idle' })
     stopRecording().catch(() => {})
+    // Restore pass-through before hiding — if the cursor was over the panel
+    // when dismissed the overlay window would otherwise stay in hit-test mode
+    // and block the next shortcut trigger check.
+    window.api.setCursorPassthrough(true)
     // Tell main to hide the window and unblock the screen.
-    // Without this the BrowserWindow stays shown and intercepts input.
     window.api.dismissOverlay()
   }, [stopRecording])
 
@@ -281,7 +284,10 @@ function RecordingWidget({ stream, onSubmit, onCancel }: {
   useAudioVisualiser(canvasRef, stream)
   return (
     <div style={{ position: 'fixed', inset: 0, userSelect: 'none', pointerEvents: 'none' }}>
-      <div style={{
+      <div
+        onMouseEnter={() => window.api.setCursorPassthrough(false)}
+        onMouseLeave={() => window.api.setCursorPassthrough(true)}
+        style={{
         position: 'absolute', bottom: 40, left: '50%', transform: 'translateX(-50%)',
         width: 300, background: 'rgba(10,10,14,0.92)',
         border: '1px solid rgba(108,99,255,0.55)', borderRadius: 18,
@@ -379,7 +385,11 @@ function StepsPanel({ resp, panelWidth, pos, setPos, onDismiss, onAskAnother }: 
         .hover-steps-scroll::-webkit-scrollbar-track { background: transparent; }
         .hover-steps-scroll::-webkit-scrollbar-thumb { background: rgba(108,99,255,0.4); border-radius: 4px; }
       `}</style>
-      <div style={{ position: 'absolute', left: resolvedPos.x, top: resolvedPos.y, pointerEvents: 'auto', userSelect: 'none', animation: 'panel-slide-in 0.25s cubic-bezier(0.22,1,0.36,1) both' }}>
+      <div
+        onMouseEnter={() => window.api.setCursorPassthrough(false)}
+        onMouseLeave={() => window.api.setCursorPassthrough(true)}
+        style={{ position: 'absolute', left: resolvedPos.x, top: resolvedPos.y, pointerEvents: 'auto', userSelect: 'none', animation: 'panel-slide-in 0.25s cubic-bezier(0.22,1,0.36,1) both' }}
+      >
         <div style={{ position: 'relative', width: panelWidth }}>
           <div
             className="hover-steps-scroll"
@@ -455,7 +465,11 @@ function StepCard({ step }: { step: BeaconStep }) {
 
 function ErrorCard({ message, onDismiss }: { message: string; onDismiss: () => void }) {
   return (
-    <div style={{ position: 'absolute', bottom: 32, left: '50%', transform: 'translateX(-50%)', background: 'rgba(20,10,10,0.96)', border: '1px solid rgba(239,68,68,0.4)', borderRadius: 12, padding: '14px 20px', maxWidth: 400, display: 'flex', alignItems: 'center', gap: 10, pointerEvents: 'auto', boxShadow: '0 4px 24px rgba(0,0,0,0.55)' }}>
+    <div
+      onMouseEnter={() => window.api.setCursorPassthrough(false)}
+      onMouseLeave={() => window.api.setCursorPassthrough(true)}
+      style={{ position: 'absolute', bottom: 32, left: '50%', transform: 'translateX(-50%)', background: 'rgba(20,10,10,0.96)', border: '1px solid rgba(239,68,68,0.4)', borderRadius: 12, padding: '14px 20px', maxWidth: 400, display: 'flex', alignItems: 'center', gap: 10, pointerEvents: 'auto', boxShadow: '0 4px 24px rgba(0,0,0,0.55)' }}
+    >
       <span style={{ color: '#ef4444', fontSize: 18, flexShrink: 0 }}>⚠</span>
       <div style={{ flex: 1 }}>
         <p style={{ margin: 0, color: '#fff', fontSize: 13, fontWeight: 600 }}>Something went wrong</p>
