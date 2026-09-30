@@ -510,7 +510,11 @@ fn dismiss_overlay(app: AppHandle) {
     if let Some(overlay) = get_overlay(&app) {
         let _ = overlay.hide();
         let _ = overlay.set_ignore_cursor_events(true);
-        let _ = app.emit_to("overlay", "capture-end", ());
+        // Do NOT emit capture-end here — this command is always called *from* the
+        // renderer (dismiss button / cancel), so the renderer has already reset its
+        // own state. Emitting capture-end back would trigger a second dismiss()
+        // call which re-invokes dismiss_overlay, creating a loop that can leave
+        // the window in a broken visible/hidden state and block the next shortcut.
     }
 }
 

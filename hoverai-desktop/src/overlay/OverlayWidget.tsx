@@ -76,6 +76,14 @@ export default function OverlayWidget() {
     })
   }, [])
 
+  // Reset local state only — does NOT call dismissOverlay IPC.
+  // Used by onCaptureEnd (Tauri already hid the window) to avoid a second
+  // dismiss_overlay call that would create a hide/capture-end loop.
+  const resetState = useCallback(() => {
+    setState({ kind: 'idle' })
+    stopRecording().catch(() => {})
+  }, [stopRecording])
+
   const dismiss = useCallback(() => {
     setState({ kind: 'idle' })
     stopRecording().catch(() => {})
@@ -125,9 +133,12 @@ export default function OverlayWidget() {
       await startRecording()
       setState({ kind: 'recording', stream: streamRef.current })
     })
-    const unsubEnd = window.api.onCaptureEnd(() => { dismiss() })
+    // capture-end is only emitted by Tauri when the shortcut key is pressed
+    // while the overlay is already visible (toggle-dismiss). Tauri has already
+    // hidden the window, so we only reset renderer state — no IPC call.
+    const unsubEnd = window.api.onCaptureEnd(() => { resetState() })
     return () => { unsubStart(); unsubEnd() }
-  }, [startRecording, dismiss])
+  }, [startRecording, resetState])
 
   // ── Query results ─────────────────────────────────────────────────────────
   useEffect(() => {
