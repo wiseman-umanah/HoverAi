@@ -181,7 +181,7 @@ export default function LandingPage() {
 				transition={{ duration: 0.5, delay: 0.38, ease: EASE }}
 			>
 				<Link
-				to="/signup"
+				to="/download"
 				className="inline-flex items-center gap-2 px-7 py-3.5 rounded-full text-[16px] font-semibold text-white transition-opacity hover:opacity-90 whitespace-nowrap"
 				style={{ background: 'linear-gradient(135deg, #615fff 0%, #432dd7 100%)' }}
 				>
@@ -439,12 +439,13 @@ export default function LandingPage() {
 				            </div>
 
 				            {/* CTA */}
-				            <button
-				              className="w-full py-3.5 rounded-full text-[16px] font-semibold mb-7 transition-opacity hover:opacity-90"
-                  style={plan.ctaStyle as React.CSSProperties}
-                >
-                  {plan.cta}
-                </button>
+				            <Link
+				              to="/download"
+				              className="w-full py-3.5 rounded-full text-[16px] font-semibold mb-7 transition-opacity hover:opacity-90 text-center block"
+				               style={plan.ctaStyle as React.CSSProperties}
+				             >
+				               {plan.cta}
+				             </Link>
 
                 {/* Features */}
                 <ul className="flex flex-col gap-3 mt-auto">
@@ -533,7 +534,7 @@ export default function LandingPage() {
               Free to start. No credit card. Set up your shortcut in under a minute.
             </p>
             <Link
-              to="/signup"
+              to="/download"
               className="inline-flex items-center gap-2 px-8 py-3.5 rounded-full text-[16px] font-semibold text-indigo-700 bg-white hover:bg-white/90 transition-colors whitespace-nowrap"
             >
               Get Started Free

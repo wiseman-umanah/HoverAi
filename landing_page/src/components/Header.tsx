@@ -91,15 +91,8 @@ export default function Header() {
 
         {/* Right actions */}
         <div className="flex items-center gap-6">
-          <a
-            href="#pricing"
-            className="hidden lg:block text-[15px] text-white/80 hover:text-white transition-colors"
-            onClick={handleAnchorClick}
-          >
-            Sign In
-          </a>
           <Link
-            to="/signup"
+            to="/download"
             className="text-[11px] sm:text-[15px] font-semibold px-3 sm:px-6 py-1.5 sm:py-2.5 rounded-full text-white transition-opacity hover:opacity-90 whitespace-nowrap"
             style={{ background: 'linear-gradient(135deg, #615fff 0%, #432dd7 100%)' }}
           >
@@ -181,7 +174,7 @@ export default function Header() {
               transition={{ delay: 0.35, duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
             >
               <Link
-                to="/signup"
+                to="/download"
                 className="w-full flex items-center justify-center gap-2 py-4 rounded-full text-[16px] font-semibold text-white"
                 style={{ background: 'linear-gradient(135deg, #615fff 0%, #432dd7 100%)' }}
                 onClick={() => setOpen(false)}
@@ -189,14 +182,6 @@ export default function Header() {
                 Get Started Free
                 <RemixIcon name="ri-arrow-right-line" size={18} color="#fff" />
               </Link>
-              <a
-                href="#pricing"
-                className="w-full flex items-center justify-center py-4 rounded-full text-[15px] font-semibold text-white/70"
-                style={{ border: '1px solid rgba(255,255,255,0.15)' }}
-                onClick={e => { handleAnchorClick(e); setOpen(false) }}
-              >
-                Sign In
-              </a>
             </motion.div>
           </motion.div>
         )}

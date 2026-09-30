@@ -1,3 +1,4 @@
+import { Link } from 'react-router-dom'
 import { motion } from 'framer-motion'
 
 const BRAND = '#615fff'
@@ -108,28 +109,45 @@ export default function LandingFooter() {
 
         {/* Nav columns */}
         <div className="flex flex-col sm:flex-row justify-between gap-16 sm:gap-20">
-          {[
-            { heading: 'Product', links: [['Features','#features'],['Pricing','#pricing'],['Language','#languages']] },
-            { heading: 'Company', links: [['About','#'],['Contact','#']] },
-            { heading: 'Product', links: [['Privacy Policy','#'],['Terms of Use','#']] },
-          ].map(col => (
-            <div key={col.heading + col.links[0][0]}>
-              <p className="text-[15px] font-semibold text-white mb-8">{col.heading}</p>
-              <ul className="flex flex-col gap-2.5">
-                {col.links.map(([label, href]) => (
-                  <li key={label}>
-                    <a
-                      href={href}
-                      className="text-[14px] transition-colors hover:text-white"
-                      style={{ color: 'rgba(255,255,255,0.55)' }}
-                    >
-                      {label}
-                    </a>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))}
+          {/* Product */}
+          <div>
+            <p className="text-[15px] font-semibold text-white mb-8">Product</p>
+            <ul className="flex flex-col gap-2.5">
+              {[['Features','#features'],['Pricing','#pricing'],['Language','#languages'],['Download','/download']].map(([label, href]) => (
+                <li key={label}>
+                  {href.startsWith('/') ? (
+                    <Link to={href} className="text-[14px] transition-colors hover:text-white" style={{ color: 'rgba(255,255,255,0.55)' }}>{label}</Link>
+                  ) : (
+                    <a href={href} className="text-[14px] transition-colors hover:text-white" style={{ color: 'rgba(255,255,255,0.55)' }}>{label}</a>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          {/* Company */}
+          <div>
+            <p className="text-[15px] font-semibold text-white mb-8">Company</p>
+            <ul className="flex flex-col gap-2.5">
+              {[['About','#'],['Contact','#']].map(([label, href]) => (
+                <li key={label}>
+                  <a href={href} className="text-[14px] transition-colors hover:text-white" style={{ color: 'rgba(255,255,255,0.55)' }}>{label}</a>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          {/* Legal */}
+          <div>
+            <p className="text-[15px] font-semibold text-white mb-8">Legal</p>
+            <ul className="flex flex-col gap-2.5">
+              {[['Privacy Policy','/privacy-policy'],['Terms of Use','/terms']].map(([label, href]) => (
+                <li key={label}>
+                  <Link to={href} className="text-[14px] transition-colors hover:text-white" style={{ color: 'rgba(255,255,255,0.55)' }}>{label}</Link>
+                </li>
+              ))}
+            </ul>
+          </div>
         </div>
       </div>
 
