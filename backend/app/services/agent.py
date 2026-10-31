@@ -5,7 +5,7 @@ Architecture
 The agent maintains a conversation history (list of messages) in an
 in-process session store keyed by session_id.  Each turn:
 
-  1. The Electron overlay sends the CURRENT screenshot + result of the
+  1. The desktop overlay sends the CURRENT screenshot + result of the
      last action.
   2. The agent appends the screenshot + result to the conversation.
   3. It calls Qwen3 with the full history: "given everything you've done
@@ -41,8 +41,6 @@ Each turn sends the full history.  To stay under Groq's 7k ITPM:
 """
 
 import asyncio
-import base64
-import io
 import json
 import logging
 import re
@@ -52,12 +50,8 @@ from typing import Any
 
 from app.config import settings
 from app.schemas.agent import AgentAction, AgentResponse
-from app.services.llm_client import (
-    active_llm_model,
-    active_vision_model,
-    llm_client,
-    vision_client,
-)
+from app.services.images import compress_to_jpeg_b64
+from app.services.llm_client import groq_client
 
 logger = logging.getLogger(__name__)
 
@@ -65,13 +59,9 @@ logger = logging.getLogger(__name__)
 
 MAX_AGENT_TURNS: int = 6          # hard cap — prevents runaway loops
 SESSION_TTL_S: float = 300.0      # 5 min inactivity → session expires
-# Minimum gap between turns — enforced when Groq handles reasoning (30 RPM).
-# In full local mode (both vision + reasoning on Ollama) this is skipped.
-# In hybrid mode (moondream vision + Groq reasoning) this IS enforced.
+# Minimum gap between turns — keeps us under Groq's 30 RPM cap.
 MIN_TURN_INTERVAL_S: float = 3.0
-# For Groq (multimodal): 400×225 q=28 keeps image tokens ~500-800.
-# For local text-only models: the image is never sent to the LLM — only the
-# moondream description is — so compression still happens but only for moondream.
+# 400×225 q=28 keeps image tokens ~500-800 per turn.
 _AGENT_MAX_WIDTH = 400
 _AGENT_MAX_HEIGHT = 225
 _AGENT_JPEG_QUALITY = 28
@@ -113,37 +103,26 @@ def _cleanup_expired() -> None:
 
 # ── Image compression ─────────────────────────────────────────────────────────
 
-def _compress(screenshot_b64: str) -> str:
+def _compress(image_bytes: bytes) -> str:
     """Compress a screenshot to fit within per-turn token budget.
 
     Tighter than the single-shot query pipeline because the agent keeps
-    multiple turns in context — total token cost compounds.
+    multiple turns in context — total token cost compounds. CPU-bound: call
+    through ``asyncio.to_thread`` (B4).
 
     Args:
-        screenshot_b64: Base64-encoded PNG/JPEG with optional data URI prefix.
+        image_bytes: Raw PNG/JPEG bytes of the screenshot.
 
     Returns:
         Plain base64 JPEG string at ``_AGENT_MAX_WIDTH``×``_AGENT_MAX_HEIGHT``
-        resolution.  Returns the (stripped) original on any error.
+        resolution.
+
+    Raises:
+        InvalidImageError: If the bytes are not a decodable image.
     """
-    try:
-        from PIL import Image  # noqa: PLC0415
-
-        raw = screenshot_b64
-        if "," in raw:
-            raw = raw.split(",", 1)[1]
-
-        img = Image.open(io.BytesIO(base64.b64decode(raw))).convert("RGB")
-        img.thumbnail((_AGENT_MAX_WIDTH, _AGENT_MAX_HEIGHT), Image.Resampling.LANCZOS)
-        out = io.BytesIO()
-        img.save(out, format="JPEG", quality=_AGENT_JPEG_QUALITY, optimize=True)
-        return base64.b64encode(out.getvalue()).decode()
-    except Exception as exc:
-        logger.warning("Agent screenshot compression failed: %s", exc)
-        raw = screenshot_b64
-        if "," in raw:
-            raw = raw.split(",", 1)[1]
-        return raw
+    return compress_to_jpeg_b64(
+        image_bytes, _AGENT_MAX_WIDTH, _AGENT_MAX_HEIGHT, _AGENT_JPEG_QUALITY
+    )
 
 
 # ── Prompt helpers ────────────────────────────────────────────────────────────
@@ -225,7 +204,7 @@ WHEN TO GIVE UP (return goal_achieved=true with a helpful spoken_reply):
 
 
 def _strip_thinking(raw: str) -> str:
-    """Remove Qwen3/phi3 <think>...</think> blocks before JSON parsing."""
+    """Remove Qwen3 <think>...</think> blocks before JSON parsing."""
     return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
 
 
@@ -234,10 +213,12 @@ def _extract_json(raw: str) -> str:
 
     Handles all the ways small models misbehave:
       - Bare JSON (correct)                         → returned as-is
-      - ```json ... ``` fences (phi3, qwen2.5)      → fences stripped
+      - ```json ... ``` fences                      → fences stripped
       - ``` ... ``` fences (no language tag)        → fences stripped
       - Leading/trailing prose around the JSON      → first {...} extracted
       - <think>...</think> blocks (Qwen3)           → stripped first
+
+    The JSON content itself is never rewritten.
 
     Args:
         raw: Raw model output string.
@@ -263,10 +244,8 @@ def _extract_json(raw: str) -> str:
         if brace_match:
             text = brace_match.group(0)
 
-    # 3. Fix common numeric typos from small models: 00.12 → 0.12
-    text = re.sub(r"\b0+(\d+\.\d+)", r"\1", text)
-    # Leading zeros on integer part: 00.5 → 0.5, 01.0 → 1.0
-    text = re.sub(r'(?<!["\w])0+(\d)', r"\1", text)
+    # NOTE: no numeric "cleanup" here. Earlier regexes that stripped leading
+    # zeros turned 0.08 into 0.8 and "0803" into "803" inside strings (B2).
 
     return text
 
@@ -326,9 +305,6 @@ def _screenshot_user_content(
 ) -> list[dict[str, Any]]:
     """Build a multimodal content block with an image + text.
 
-    Used in Groq (multimodal) mode only.  In local mode ``_describe_screen``
-    is called instead to get a text description from moondream.
-
     Args:
         compressed_b64: Plain base64 JPEG string (no data URI prefix).
         text_content: Text part of the user message.
@@ -345,73 +321,11 @@ def _screenshot_user_content(
     ]
 
 
-async def _describe_screen(compressed_b64: str, goal: str) -> str:
-    """Ask the vision model (moondream) to describe the screen in text.
-
-    Used in local mode so the text-only reasoning LLM (phi3:mini / qwen2.5)
-    receives a description it can understand instead of a raw image it cannot.
-
-    The description includes:
-      - What application/window is currently in focus
-      - Key visible UI elements with approximate positions
-      - Any text content that is relevant to the user's goal
-
-    Args:
-        compressed_b64: Plain base64 JPEG of the current screen.
-        goal: The user's voice instruction — used to focus the description.
-
-    Returns:
-        A plain-text description of the screen, or a fallback string on error.
-    """
-    prompt = (
-        f"The user wants to: {goal}\n\n"
-        "Describe what you see on the screen in detail. Include:\n"
-        "1. What application/window is in focus\n"
-        "2. All visible UI elements (buttons, menus, text fields, icons) "
-        "with their approximate positions as fractions (e.g. top-left=0.0,0.0 "
-        "bottom-right=1.0,1.0)\n"
-        "3. Any relevant text content visible\n"
-        "4. What the user would need to click or interact with to achieve their goal\n"
-        "Be precise about coordinates — the reasoning model uses them to act."
-    )
-    try:
-        resp = await vision_client.chat.completions.create(
-            model=active_vision_model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{compressed_b64}"
-                            },
-                        },
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ],
-            max_tokens=512,
-            temperature=0.1,
-        )
-        description = resp.choices[0].message.content or ""
-        logger.debug("Screen description from %s: %s", active_vision_model, description[:200])
-        return description
-    except Exception as exc:
-        logger.error("Vision model (%s) description failed: %s", active_vision_model, exc)
-        return "[screen description unavailable — proceed based on goal alone]"
-
-
-def _is_local_mode() -> bool:
-    """Return True when the local Ollama endpoint is configured."""
-    return bool(settings.local_llm_base_url.strip())
-
-
 # ── Public API ────────────────────────────────────────────────────────────────
 
 async def agent_start(
     transcript: str,
-    screenshot_b64: str,
+    screenshot: bytes,
     language: str,
     tts_voice: str,
 ) -> AgentResponse:
@@ -422,42 +336,35 @@ async def agent_start(
 
     Args:
         transcript: User's voice instruction (already transcribed).
-        screenshot_b64: Base64 screenshot of the current screen.
+        screenshot: Raw PNG/JPEG bytes of the current screen.
         language: Hover AI language code.
         tts_voice: Orpheus TTS voice to use for spoken_reply.
 
     Returns:
         ``AgentResponse`` with ``session_id``, the first ``action``, and
         ``done=False`` (or ``done=True`` if the goal is trivially achieved).
+
+    Raises:
+        InvalidImageError: If the screenshot is not a decodable image.
     """
     _cleanup_expired()
+
+    # Compress first so an invalid image never leaves an orphaned session.
+    compressed = await asyncio.to_thread(_compress, screenshot)
 
     session_id = secrets.token_hex(16)
     session = _Session(session_id=session_id, goal=transcript, language=language)
     _sessions[session_id] = session
 
-    compressed = _compress(screenshot_b64)
-
     # Initial user message — goal + first screenshot
-    # Local mode: ask moondream to describe the screen as text, then pass
-    # that description to the text-only reasoning model.
-    # Groq mode: pass image directly (multimodal supported).
-    if _is_local_mode():
-        screen_desc = await _describe_screen(compressed, transcript)
-        first_user_content: str | list[dict[str, Any]] = (
+    first_user_content = _screenshot_user_content(
+        compressed,
+        (
             f"Goal (language: {language}): {transcript}\n\n"
-            f"Current screen:\n{screen_desc}\n\n"
+            "This is the current state of the screen. "
             "What is the first action to take?"
-        )
-    else:
-        first_user_content = _screenshot_user_content(
-            compressed,
-            (
-                f"Goal (language: {language}): {transcript}\n\n"
-                "This is the current state of the screen. "
-                "What is the first action to take?"
-            ),
-        )
+        ),
+    )
 
     session.messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -469,7 +376,7 @@ async def agent_start(
 
 async def agent_turn(
     session_id: str,
-    screenshot_b64: str,
+    screenshot: bytes,
     action_result: str,
     tts_voice: str,
 ) -> AgentResponse:
@@ -480,7 +387,7 @@ async def agent_turn(
 
     Args:
         session_id: Session ID from the previous response.
-        screenshot_b64: Base64 screenshot taken AFTER the last action executed.
+        screenshot: Raw PNG/JPEG bytes taken AFTER the last action executed.
         action_result: ``"success"``, ``"no_change"``, or ``"error"``.
         tts_voice: Orpheus TTS voice to use for spoken_reply.
 
@@ -490,6 +397,7 @@ async def agent_turn(
 
     Raises:
         KeyError: If ``session_id`` is not found or has expired.
+        InvalidImageError: If the screenshot is not a decodable image.
     """
     _cleanup_expired()
 
@@ -499,16 +407,14 @@ async def agent_turn(
 
     session.touch()
 
-    # ── Rate-limit guard — always enforce (reasoning is always Groq) ──────────
-    # In hybrid mode moondream handles vision locally but Groq still handles
-    # reasoning — so we must respect the 30 RPM cap on the llm_client calls.
+    # ── Rate-limit guard — respect Groq's 30 RPM cap ─────────────────────────
     elapsed_since_last = time.monotonic() - session.last_turn_time
     if session.last_turn_time > 0 and elapsed_since_last < MIN_TURN_INTERVAL_S:
         wait = MIN_TURN_INTERVAL_S - elapsed_since_last
         logger.debug("Agent rate-limit sleep %.2fs for session %s", wait, session_id)
         await asyncio.sleep(wait)
 
-    compressed = _compress(screenshot_b64)
+    compressed = await asyncio.to_thread(_compress, screenshot)
     result_label = {
         "success": "✓ Action succeeded",
         "no_change": "✗ No change — the action may have missed the target",
@@ -516,20 +422,13 @@ async def agent_turn(
     }.get(action_result, action_result)
 
     # Append feedback + new screenshot as the next user message
-    if _is_local_mode():
-        screen_desc = await _describe_screen(compressed, session.goal)
-        turn_content: str | list[dict[str, Any]] = (
-            f"{result_label}. Current screen:\n{screen_desc}\n\n"
+    turn_content = _screenshot_user_content(
+        compressed,
+        (
+            f"{result_label}. This is the screen now.\n"
             "What is the next action to take toward the goal?"
-        )
-    else:
-        turn_content = _screenshot_user_content(
-            compressed,
-            (
-                f"{result_label}. This is the screen now.\n"
-                "What is the next action to take toward the goal?"
-            ),
-        )
+        ),
+    )
 
     session.messages.append({"role": "user", "content": turn_content})
 
@@ -585,8 +484,8 @@ async def _run_turn(session: _Session, tts_voice: str) -> AgentResponse:
                 ),
             })
         try:
-            resp = await llm_client.chat.completions.create(
-                model=active_llm_model,
+            resp = await groq_client.chat.completions.create(
+                model=settings.vision_model,
                 messages=session.messages,  # type: ignore[arg-type]
                 temperature=0.15,
                 max_tokens=1200,

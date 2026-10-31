@@ -10,9 +10,9 @@ name = "hover-ai-backend"
 version = "0.1.0"
 description = "Hover AI FastAPI backend — African-language STT benchmarking & UI beacon assistant"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    "aiosqlite>=0.22.1",
+    "alembic>=1.16.0",
     "asyncpg>=0.31.0",
     "bcrypt>=5.0.0",
     "fastapi>=0.141.1",
@@ -21,9 +21,7 @@ dependencies = [
     "pillow>=12.3.0",
     "pydantic-settings>=2.15.0",
     "pydantic[email]>=2.13.5",
-    "pydub>=0.25.1",
-    "python-dotenv>=1.2.3",
-    "python-jose[cryptography]>=3.5.0",
+    "pyjwt>=2.10.0",
     "python-multipart>=0.0.32",
     "sqlalchemy[asyncio]>=2.0.52",
     "sqlmodel>=0.0.42",
@@ -35,11 +33,30 @@ dependencies = [
 hover     = "app._scripts:run"
 hover-dev = "app._scripts:run_dev"
 setup-db  = "scripts.setup_db:main_sync"
+eval-grounding = "scripts.eval_grounding:main"
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
+    "aiosqlite>=0.22.1",
     "pyright>=1.1.414",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "ruff>=0.12.0",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Explicit, minimal set (pyflakes + core pycodestyle + import order + bugbear
+# + async pitfalls) so upgrades of ruff's defaults don't change the gate.
+select = ["E4", "E7", "E9", "F", "I", "B", "ASYNC"]
+# B008: FastAPI's Depends()/File()/Form() defaults are the idiomatic pattern.
+ignore = ["B008"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "scripts"]
+# backend/alembic/ (migrations dir) would otherwise make ruff treat the package as local.
+known-third-party = ["alembic"]
+

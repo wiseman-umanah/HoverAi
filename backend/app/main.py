@@ -3,13 +3,13 @@
 Responsibilities (wiring only — no business logic):
   - Create the FastAPI application instance.
   - Register CORS middleware.
-  - Manage the application lifespan (DB table creation on startup).
+  - Manage the application lifespan (no DB work at startup — the schema is
+    owned by Alembic; run ``uv run alembic upgrade head`` before deploying).
   - Mount the versioned API router at /api/v1.
   - Serve a custom /docs that auto-authorizes after sign-in.
 """
 
 import logging
-import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -19,12 +19,12 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.api.v1.router import router as v1_router
-from app.db import create_db_and_tables
+from app.config import settings
+from app.db import engine
 
 # In dev (LOG_LEVEL=DEBUG or running hover-dev), show debug logs from app code.
 # In production uvicorn sets its own handlers; we just set the level here.
-_log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, _log_level, logging.INFO))
+logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
 
 
 @asynccontextmanager
@@ -32,11 +32,12 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     """Manage startup and shutdown of shared resources.
 
     Startup:
-        - Runs ``CREATE TABLE IF NOT EXISTS`` for all SQLModel tables.
-          In production, run the migration SQL files manually instead.
+        - Nothing. Tables are no longer created here (B14): ``create_all``
+          never alters existing tables and silently diverged from the real
+          schema. Run ``uv run alembic upgrade head`` instead.
 
     Shutdown:
-        - SQLAlchemy disposes the engine connection pool automatically.
+        - Disposes the engine connection pool.
 
     Args:
         application: The FastAPI application instance (unused but required
@@ -45,8 +46,8 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     Yields:
         None — control returns to FastAPI while the app is running.
     """
-    await create_db_and_tables()
     yield
+    await engine.dispose()
 
 
 def create_app() -> FastAPI:
@@ -59,7 +60,7 @@ def create_app() -> FastAPI:
         title="Hover AI API",
         version="0.1.0",
         description=(
-            "Voice-guided UI assistant with African language STT benchmarking.\n\n"
+            "Voice-guided UI assistant for African languages.\n\n"
             "**Quick start in Swagger:**\n"
             "1. Call `POST /api/v1/auth/signup` or `POST /api/v1/auth/signin`.\n"
             "2. The Bearer token is **automatically applied** — no manual copy-paste needed.\n"
@@ -89,7 +90,7 @@ def create_app() -> FastAPI:
             "version": "0.1.0",
             "description": (
                 "Voice-guided UI assistant — African language STT with "
-                "Intron Sahara, Groq Whisper, and HF AfriSpeech benchmarking."
+                "Intron Sahara STT/TTS, Groq Whisper STT and Groq vision."
             ),
             "docs": "/docs",
             "health": "/api/v1/health",

@@ -2,8 +2,7 @@
 
 import time
 
-import pytest
-from jose import jwt
+import jwt
 
 from app.auth import create_access_token, hash_password, verify_password
 from app.config import settings
@@ -44,6 +43,11 @@ class TestVerifyPassword:
         hashed = hash_password("correct_password")
         assert verify_password("wrong_password", hashed) is False
 
+    def test_over_72_bytes_returns_false_instead_of_raising(self):
+        """bcrypt 5 raises on >72 bytes; verify_password must just say no (B3)."""
+        hashed = hash_password("a" * 72)
+        assert verify_password("a" * 73, hashed) is False
+
     def test_empty_string_does_not_match(self):
         """An empty string does not match a real password hash."""
         hashed = hash_password("notempty")
@@ -74,6 +78,15 @@ class TestCreateAccessToken:
             token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
         )
         assert payload["exp"] > time.time()
+
+    def test_tampered_token_is_rejected(self):
+        """A token signed with another secret fails PyJWT verification."""
+        token = jwt.encode({"sub": "user-123"}, "x" * 40, algorithm="HS256")
+        try:
+            jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        except jwt.InvalidSignatureError:
+            return
+        raise AssertionError("tampered token was accepted")
 
     def test_caller_dict_is_not_mutated(self):
         """create_access_token does not modify the caller's dict."""

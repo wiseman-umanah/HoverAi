@@ -20,6 +20,7 @@ from pathlib import Path
 
 import websockets
 
+
 # ── Config ────────────────────────────────────────────────────────────────────
 # Read key from environment first, then fall back to .env file in parent dir.
 def _load_api_key() -> str:

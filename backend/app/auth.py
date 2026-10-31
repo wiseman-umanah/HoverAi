@@ -2,7 +2,17 @@
 
 This module handles password hashing, JWT creation/validation, and refresh
 token generation. All database interactions happen in the routers that call
-these functions.
+these functions, except ``get_current_user`` which does one short lookup.
+
+Design notes:
+  - JWTs use PyJWT (python-jose is unmaintained). HS256, claims ``sub`` + ``exp``.
+  - bcrypt 5 raises on inputs over 72 bytes instead of truncating (B3).
+    Signup rejects such passwords at validation time (``schemas/auth.py``);
+    ``verify_password`` simply returns False for them so signin answers 401.
+  - ``get_current_user`` opens and closes its own session rather than using
+    ``get_session``: a dependency-scoped session would stay checked out until
+    after the response, pinning a pool connection through the whole /query
+    pipeline (B6).
 """
 
 import logging
@@ -11,14 +21,13 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import bcrypt
+import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.config import settings
-from app.db import get_session
+from app.db import AsyncSessionLocal
 from app.models.models import User
 
 logger = logging.getLogger(__name__)
@@ -27,19 +36,27 @@ logger = logging.getLogger(__name__)
 # The tokenUrl makes Swagger's "Authorize" button POST to /signin automatically.
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/signin")
 
+# bcrypt only looks at the first 72 bytes; bcrypt>=5 raises on longer input.
+BCRYPT_MAX_PASSWORD_BYTES = 72
+
 
 def hash_password(plain: str) -> str:
     """Hash a plain-text password using bcrypt.
 
-    Passwords longer than 72 bytes are truncated by bcrypt by design.
-    The 128-char limit in the schema keeps input well within this bound.
+    Callers must validate the length first (``SignupRequest`` does): bcrypt 5
+    raises ``ValueError`` for passwords over 72 UTF-8 bytes.
 
     Args:
         plain: The raw password string provided by the user.
 
     Returns:
         A bcrypt hash string (UTF-8 decoded) safe to store in the database.
+
+    Raises:
+        ValueError: If the password exceeds 72 UTF-8 bytes.
     """
+    if len(plain.encode()) > BCRYPT_MAX_PASSWORD_BYTES:
+        raise ValueError("Password must be at most 72 bytes.")
     return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
 
 
@@ -51,8 +68,11 @@ def verify_password(plain: str, hashed: str) -> bool:
         hashed: The bcrypt hash string stored in the database.
 
     Returns:
-        True if the password matches the hash, False otherwise.
+        True if the password matches the hash, False otherwise (including
+        passwords over 72 bytes, which can never have been hashed).
     """
+    if len(plain.encode()) > BCRYPT_MAX_PASSWORD_BYTES:
+        return False
     return bcrypt.checkpw(plain.encode(), hashed.encode())
 
 
@@ -90,19 +110,17 @@ def create_refresh_token() -> tuple[str, datetime]:
     return token, expires_at
 
 
-async def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    session: AsyncSession = Depends(get_session),
-) -> User:
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
     """FastAPI dependency that validates a JWT and returns the current User.
 
     Extracts the Bearer token from the ``Authorization`` header, validates
-    the signature and expiry, then fetches the matching ``User`` row via
-    SQLModel.
+    the signature and expiry, then fetches the matching ``User`` row in a
+    short-lived session that is closed before the route body runs. The
+    returned instance is detached; routes that modify it must ``add`` it to
+    their own session.
 
     Args:
         token: JWT string injected by the ``OAuth2PasswordBearer`` scheme.
-        session: Async database session injected by ``get_session``.
 
     Returns:
         The authenticated ``User`` SQLModel instance.
@@ -124,11 +142,12 @@ async def get_current_user(
         if user_id_str is None:
             raise credentials_exception
         user_id = uuid.UUID(user_id_str)
-    except (JWTError, ValueError):
-        raise credentials_exception
+    except (jwt.InvalidTokenError, ValueError):
+        raise credentials_exception from None
 
-    result = await session.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(User).where(User.id == user_id))
+        user = result.scalar_one_or_none()
     if user is None:
         raise credentials_exception
 

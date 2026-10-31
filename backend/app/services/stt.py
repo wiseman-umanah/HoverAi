@@ -25,12 +25,17 @@ Language code mapping — confirmed against Sahara /stt/v1/languages endpoint:
   sw             |  sw          |  Swahili
   wo             |  wo          |  Wolof
   zu             |  zu          |  Zulu (STT only — TTS uses en+zulu accent)
+
+Error contract (B7):
+  A provider failure raises ``STTProviderError`` (``rate_limited=True`` for a
+  429) instead of returning an empty transcript, so the route can tell
+  "Groq is down" (502/429) apart from "the user said nothing" (422).
 """
 
-import asyncio
 import logging
 import time
 
+import openai
 from openai import AsyncOpenAI
 
 from app.config import settings
@@ -66,6 +71,24 @@ _groq_client = AsyncOpenAI(
     max_retries=1,
     timeout=15.0,
 )
+
+
+class STTProviderError(Exception):
+    """Raised when the speech-to-text provider fails or times out.
+
+    Attributes:
+        rate_limited: True when the provider answered 429 (rate limit).
+    """
+
+    def __init__(self, message: str, *, rate_limited: bool = False) -> None:
+        """Initialise with a description and the rate-limit flag.
+
+        Args:
+            message: Description of the provider failure (for logs).
+            rate_limited: Whether the failure was a 429 from the provider.
+        """
+        super().__init__(message)
+        self.rate_limited = rate_limited
 
 
 def _sahara_language(hover_lang: str) -> str:
@@ -110,8 +133,11 @@ async def _call_groq_whisper(wav_bytes: bytes, language: str) -> tuple[str, int]
         language: Hover AI language code (e.g. ``"ig"``, ``"en-pidgin"``).
 
     Returns:
-        A tuple of ``(transcript, elapsed_ms)``.
-        Returns ``("", elapsed_ms)`` on any failure.
+        A tuple of ``(transcript, elapsed_ms)``. The transcript may be empty
+        when the provider succeeded but heard no speech.
+
+    Raises:
+        STTProviderError: On any provider/network failure or timeout.
     """
     start = time.monotonic()
 
@@ -133,13 +159,17 @@ async def _call_groq_whisper(wav_bytes: bytes, language: str) -> tuple[str, int]
                 file=("audio.wav", wav_bytes, "audio/wav"),
             )
         elapsed = int((time.monotonic() - start) * 1000)
-        transcript = response.text if hasattr(response, "text") else str(response)
-        logger.info("Groq Whisper transcription complete in %dms", elapsed)
-        return (transcript, elapsed)
+    except openai.RateLimitError as exc:
+        logger.warning("Groq Whisper rate-limited: %s", exc)
+        raise STTProviderError("Groq Whisper rate limit", rate_limited=True) from exc
     except Exception as exc:
-        elapsed = int((time.monotonic() - start) * 1000)
         logger.error("Groq Whisper STT error: %s", exc, exc_info=True)
-        return ("", elapsed)
+        raise STTProviderError(f"Groq Whisper failed: {exc}") from exc
+
+    elapsed = int((time.monotonic() - start) * 1000)
+    transcript = response.text if hasattr(response, "text") else str(response)
+    logger.info("Groq Whisper transcription complete in %dms", elapsed)
+    return (transcript.strip(), elapsed)
 
 
 async def run_stt(audio_bytes: bytes, wav_bytes: bytes, language: str) -> STTResult:
@@ -159,7 +189,11 @@ async def run_stt(audio_bytes: bytes, wav_bytes: bytes, language: str) -> STTRes
         language: Hover AI language code (e.g. ``"en-pidgin"``).
 
     Returns:
-        An ``STTResult`` with the transcript ready for immediate use.
+        An ``STTResult`` with the transcript ready for immediate use. The
+        transcript is empty only when the provider succeeded and heard nothing.
+
+    Raises:
+        STTProviderError: If Groq Whisper fails (see ``_call_groq_whisper``).
     """
     # Sahara streaming path — only when explicitly enabled
     _SAHARA_STREAM_LANGS = {"en-pidgin", "yo", "ha", "ig"}

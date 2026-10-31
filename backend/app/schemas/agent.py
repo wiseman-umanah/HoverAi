@@ -4,11 +4,10 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-
 # ── Outbound ───────────────────────────────────────────────────────────────────
 
 class AgentAction(BaseModel):
-    """A single action for the Electron overlay to execute.
+    """A single action for the desktop overlay to execute.
 
     Mirrors ``BeaconStep`` but semantically represents what the agent DECIDED
     to do next, not a pre-planned list.  The overlay executes exactly one

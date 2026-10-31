@@ -1,0 +1,46 @@
+{
+  "app": "Notes",
+  "window_title": "Notes - Untitled",
+  "window": {
+    "x": 0.0,
+    "y": 0.0,
+    "w": 1.0,
+    "h": 1.0
+  },
+  "cursor": {
+    "x": 0.5,
+    "y": 0.5
+  },
+  "elements": [
+    {
+      "id": 1,
+      "role": "button",
+      "name": "Save",
+      "x": 0.2656,
+      "y": 0.575,
+      "w": 0.125,
+      "h": 0.08,
+      "enabled": true
+    },
+    {
+      "id": 2,
+      "role": "button",
+      "name": "Don't Save",
+      "x": 0.4141,
+      "y": 0.575,
+      "w": 0.1719,
+      "h": 0.08,
+      "enabled": true
+    },
+    {
+      "id": 3,
+      "role": "button",
+      "name": "Cancel",
+      "x": 0.6094,
+      "y": 0.575,
+      "w": 0.125,
+      "h": 0.08,
+      "enabled": true
+    }
+  ]
+}

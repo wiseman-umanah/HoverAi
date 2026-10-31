@@ -5,6 +5,12 @@ Each class here serves double duty:
   - As a Pydantic model for type-safe access
 
 The schemas in app/schemas/ extend these for request/response shapes.
+
+The database schema is owned by Alembic (``alembic/versions/``). These models
+must stay in sync with it: after changing a model, generate a revision with
+``uv run alembic revision --autogenerate -m "..."`` and review it.
+``uv run alembic check`` fails if models and migrations disagree.
+FK ``ondelete`` rules and JSONB are declared here so autogenerate sees them.
 """
 
 import uuid
@@ -12,6 +18,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, ClassVar, Optional
 
 from sqlalchemy import JSON, Boolean
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Column, DateTime, Field, Relationship, SQLModel, func, text
 
 if TYPE_CHECKING:
@@ -21,6 +28,10 @@ if TYPE_CHECKING:
     # satisfies both without changing runtime behaviour.
     from typing import Any
     declared_attr = ClassVar[Any]
+
+
+# JSONB on Postgres (indexable, compact); plain JSON elsewhere (SQLite tests).
+_JSON_TYPE = JSON().with_variant(JSONB(), "postgresql")
 
 
 class User(SQLModel, table=True):
@@ -78,7 +89,7 @@ class UserSettings(SQLModel, table=True):
 
     __tablename__ = "user_settings"  # type: ignore[assignment]
 
-    user_id: uuid.UUID = Field(foreign_key="users.id", primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="users.id", primary_key=True, ondelete="CASCADE")
     overlay_opacity: float = Field(default=1.0)
     overlay_size: str = Field(default="default", max_length=20)
     mic_sensitivity: int = Field(default=5)
@@ -127,7 +138,7 @@ class RefreshToken(SQLModel, table=True):
         primary_key=True,
         sa_column_kwargs={"server_default": text("gen_random_uuid()")},
     )
-    user_id: uuid.UUID = Field(foreign_key="users.id")
+    user_id: uuid.UUID = Field(foreign_key="users.id", ondelete="CASCADE", index=True)
     token: str = Field(max_length=128, unique=True, index=True)
     device_id: Optional[str] = Field(default=None, max_length=120)
     expires_at: datetime = Field(
@@ -163,7 +174,9 @@ class QueryLog(SQLModel, table=True):
         primary_key=True,
         sa_column_kwargs={"server_default": text("gen_random_uuid()")},
     )
-    user_id: Optional[uuid.UUID] = Field(default=None, foreign_key="users.id")
+    user_id: Optional[uuid.UUID] = Field(
+        default=None, foreign_key="users.id", ondelete="SET NULL", nullable=True
+    )
     created_at: datetime = Field(
         default_factory=datetime.utcnow,
         sa_column=Column(DateTime(timezone=True), server_default=func.now(), nullable=False),
@@ -176,10 +189,10 @@ class QueryLog(SQLModel, table=True):
 
     # Vision LLM output — stored as JSONB in PostgreSQL (text in SQLite tests)
     vision_response: Optional[str] = Field(
-        default=None, sa_column=Column(JSON, nullable=True)
+        default=None, sa_column=Column(_JSON_TYPE, nullable=True)
     )
     beacon_steps: Optional[str] = Field(
-        default=None, sa_column=Column(JSON, nullable=True)
+        default=None, sa_column=Column(_JSON_TYPE, nullable=True)
     )
 
     user: Optional[User] = Relationship(back_populates="query_logs")
@@ -210,7 +223,9 @@ class Conversation(SQLModel, table=True):
         primary_key=True,
         sa_column_kwargs={"server_default": text("gen_random_uuid()")},
     )
-    user_id: uuid.UUID = Field(foreign_key="users.id", unique=True, index=True)
+    user_id: uuid.UUID = Field(
+        foreign_key="users.id", ondelete="CASCADE", unique=True, index=True
+    )
     created_at: datetime = Field(
         default_factory=datetime.utcnow,
         sa_column=Column(DateTime(timezone=True), server_default=func.now(), nullable=False),
@@ -250,7 +265,9 @@ class ConversationMessage(SQLModel, table=True):
         primary_key=True,
         sa_column_kwargs={"server_default": text("gen_random_uuid()")},
     )
-    conversation_id: uuid.UUID = Field(foreign_key="conversations.id", index=True)
+    conversation_id: uuid.UUID = Field(
+        foreign_key="conversations.id", ondelete="CASCADE", index=True
+    )
     role: str = Field(max_length=20)        # "user" | "assistant"
     content: str
     created_at: datetime = Field(

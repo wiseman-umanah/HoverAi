@@ -2,12 +2,19 @@
 
 Uses Groq's Orpheus v1 English TTS model (canopylabs/orpheus-v1-english)
 via the OpenAI-compatible speech endpoint. Returns raw WAV bytes which the
-caller base64-encodes and sends to Electron for playback.
+caller base64-encodes and sends to the desktop app for playback.
 
 Orpheus is a high-quality neural TTS model that runs on Groq's infrastructure.
 It supports six voices and outputs WAV format only.
+
+``speak`` is the entry point used by /query: it picks Sahara (African
+languages) or Orpheus and enforces a time budget per provider (B10) —
+Sahara's enqueue/poll/download flow alone could otherwise take ~60 s. When
+both providers fail or time out the caller gets ``""`` and still returns the
+steps; audio is a nice-to-have, never a reason to fail the request.
 """
 
+import asyncio
 import base64
 import logging
 import time
@@ -15,6 +22,7 @@ import time
 from openai import AsyncOpenAI
 
 from app.config import settings
+from app.services.sahara_tts import SAHARA_VOICE_MAP, synthesise_sahara
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +67,7 @@ async def synthesise(text: str, voice: str | None = None) -> tuple[str, int]:
 
     The response is raw WAV bytes which are base64-encoded for safe embedding
     in a JSON response body. The caller attaches the result to
-    ``QueryResponse.speech_b64`` so Electron can decode and play it without a
+    ``QueryResponse.speech_b64`` so the desktop app can decode and play it without a
     second round-trip.
 
     Args:
@@ -103,3 +111,49 @@ async def synthesise(text: str, voice: str | None = None) -> tuple[str, int]:
         elapsed = int((time.monotonic() - start) * 1000)
         logger.error("TTS synthesis error: %s", exc, exc_info=True)
         return ("", elapsed)
+
+
+async def speak(
+    text: str,
+    language: str,
+    voice_gender: str = "female",
+    orpheus_voice: str | None = None,
+) -> str:
+    """Synthesise a spoken reply within the configured TTS time budget.
+
+    Sahara is tried first for languages in ``SAHARA_VOICE_MAP`` (when
+    ``settings.sahara_tts_enabled``), each provider capped at
+    ``settings.tts_timeout_s``; Orpheus is the fallback and the primary for
+    every other language.
+
+    Args:
+        text: Text to speak (the vision summary).
+        language: Hover AI language code.
+        voice_gender: ``"female"`` or ``"male"`` — passed to Sahara.
+        orpheus_voice: Concrete Orpheus voice name for the fallback.
+
+    Returns:
+        Base64 WAV, or ``""`` if TTS is disabled or every provider failed.
+    """
+    if not settings.tts_enabled or not text.strip():
+        return ""
+
+    budget = settings.tts_timeout_s
+    if settings.sahara_tts_enabled and language in SAHARA_VOICE_MAP:
+        try:
+            speech_b64, _ = await asyncio.wait_for(
+                synthesise_sahara(text, language, voice_gender=voice_gender), budget
+            )
+        except TimeoutError:
+            logger.warning("Sahara TTS exceeded %.1fs budget (language=%s)", budget, language)
+            speech_b64 = ""
+        if speech_b64:
+            return speech_b64
+        logger.warning("Sahara TTS failed for language=%s — falling back to Orpheus", language)
+
+    try:
+        speech_b64, _ = await asyncio.wait_for(synthesise(text, voice=orpheus_voice), budget)
+    except TimeoutError:
+        logger.warning("Orpheus TTS exceeded %.1fs budget", budget)
+        return ""
+    return speech_b64

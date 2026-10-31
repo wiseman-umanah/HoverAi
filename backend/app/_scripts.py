@@ -5,23 +5,31 @@ console commands inside the .venv:
 
   uv run hover       — production server (no reload, info-level logging)
   uv run hover-dev   — development server (hot reload, debug logging)
+
+The port comes from ``settings.port`` (env ``PORT``, default 8000) because
+Render and Docker hosts inject the port to bind at runtime.
 """
 
 import uvicorn
+
+from app.config import settings
 
 
 def run() -> None:
     """Start the production uvicorn server.
 
-    Binds to all interfaces on port 8000. Hot reload and debug logging
-    are disabled. Use this for staging and production deployments.
+    Binds to all interfaces on ``$PORT`` (default 8000). Hot reload and
+    debug logging are disabled; ``--proxy-headers`` handling is on so client
+    IPs/schemes from Render's proxy are respected. Use this for staging and production deployments.
     """
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
-        port=8000,
+        port=settings.port,
         reload=False,
         log_level="info",
+        proxy_headers=True,
+        forwarded_allow_ips="*",
     )
 
 
@@ -35,7 +43,7 @@ def run_dev() -> None:
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
-        port=8000,
+        port=settings.port,
         reload=True,
         log_level="debug",
     )

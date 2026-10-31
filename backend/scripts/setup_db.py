@@ -1,66 +1,47 @@
 #!/usr/bin/env python3
-"""Local database setup script.
+"""Database setup script — applies Alembic migrations.
 
-Creates all tables defined in app/models/models.py against the database
-specified in the .env file (or DATABASE_URL environment variable).
+Equivalent to ``uv run alembic upgrade head``: brings the database named by
+DATABASE_URL (from .env or the environment) up to the latest schema revision.
+
+The schema is owned by Alembic (``alembic/versions/``). The old hand-written
+SQL files in ``migrations/legacy/`` are kept for reference only; a database
+that was built from them (or from the old startup ``create_all``) must be
+stamped once instead of upgraded:
+
+    uv run alembic stamp 0001_baseline
 
 Usage:
     cd backend/
-    uv run python scripts/setup_db.py
-
-The script is safe to run multiple times — all CREATE TABLE statements
-use IF NOT EXISTS so existing data is never touched.
+    uv run setup-db
 """
 
-import asyncio
 import sys
 from pathlib import Path
 
-# Make sure the backend/ package root is on sys.path when run directly
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-
-async def main() -> None:
-    """Create all SQLModel tables in the target database.
-
-    Reads DATABASE_URL from the .env file via app.config.settings.
-    Prints each step so you can see what is happening.
-    """
-    # Import here so path insertion above takes effect first
-    from app.config import settings  # noqa: PLC0415
-    from app.db import create_db_and_tables, engine  # noqa: PLC0415
-    from app.models import models as _models_module  # noqa: PLC0415, F401
-
-    # Trigger import of all model classes so SQLModel.metadata knows about them
-    _ = _models_module
-
-    db_url_display = settings.database_url.split("@")[-1]  # hide credentials
-    print(f"Connecting to: ...@{db_url_display}")
-    print("Creating tables (IF NOT EXISTS) ...")
-
-    try:
-        await create_db_and_tables()
-        print()
-        print("Tables created successfully:")
-        from sqlmodel import SQLModel  # noqa: PLC0415
-        for table_name in sorted(SQLModel.metadata.tables.keys()):
-            print(f"  ✓ {table_name}")
-        print()
-        print("Done. Your database is ready.")
-    except Exception as exc:
-        print(f"\n✗ Database setup failed: {exc}")
-        print("\nCheck that:")
-        print("  1. DATABASE_URL in .env is correct")
-        print("  2. The Render PostgreSQL instance is running")
-        print("  3. You have network access to the database host")
-        sys.exit(1)
-    finally:
-        await engine.dispose()
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
 
 
 def main_sync() -> None:
-    """Synchronous entry point for the ``setup-db`` console script."""
-    asyncio.run(main())
+    """Run ``alembic upgrade head`` using ``backend/alembic.ini``.
+
+    Exits with status 1 and a hint if the upgrade fails.
+    """
+    from alembic import command  # noqa: PLC0415
+    from alembic.config import Config  # noqa: PLC0415
+
+    cfg = Config(str(_BACKEND_DIR / "alembic.ini"))
+    cfg.set_main_option("script_location", str(_BACKEND_DIR / "alembic"))
+    try:
+        command.upgrade(cfg, "head")
+    except Exception as exc:  # noqa: BLE001 — CLI wrapper: report and exit
+        print(f"\n✗ Database migration failed: {exc}")
+        print("\nCheck that:")
+        print("  1. DATABASE_URL in .env is correct and the database is reachable")
+        print("  2. If the tables already exist (pre-Alembic database), run:")
+        print("       uv run alembic stamp 0001_baseline")
+        sys.exit(1)
+    print("Done. Database is at the latest revision.")
 
 
 if __name__ == "__main__":

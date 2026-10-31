@@ -11,7 +11,6 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from app.services.stt import LANGUAGE_MAP
-from app.services.sahara_tts import SAHARA_VOICE_MAP
 from app.services.vision import _LANGUAGE_CONFIGS
 
 router = APIRouter()

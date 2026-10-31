@@ -5,7 +5,7 @@ Route prefix: /api/v1/auth (set in app/api/v1/router.py)
 Token strategy:
   - Access token:  short-lived JWT (15 min). Sent as Authorization: Bearer.
   - Refresh token: long-lived opaque random hex (90 days) stored in DB.
-    The client stores it securely (Electron safeStorage) and calls
+    The client stores it securely (the OS keychain) and calls
     POST /auth/refresh when the access token expires. Users never need to
     re-enter their password for the lifetime of the refresh token.
 
@@ -13,14 +13,31 @@ Swagger auto-authorize:
   POST /auth/signin accepts both JSON body and OAuth2 form fields so that
   the Swagger UI "Authorize" dialog works out of the box. After a successful
   call the custom JS in main.py automatically stores the returned Bearer token.
+
+Durability (B6):
+  Every route that returns tokens commits explicitly *before* returning.
+  ``get_session`` also commits, but only after the response has been sent —
+  too late to turn a failed write into an error the client can see.
+
+Refresh rotation (B5):
+  The old token is revoked with a single conditional
+  ``UPDATE ... WHERE token=:t AND NOT revoked AND expires_at > now RETURNING``.
+  Two concurrent refreshes with the same token can therefore never both
+  succeed: exactly one UPDATE matches the row, the other gets zero rows → 401.
+  TODO: reuse detection — a refresh with an already-revoked token is a theft
+  signal and should revoke the whole token family for that user/device. Not
+  done yet because the desktop client still has two refresh paths that can
+  race (fixed client-side with a single-flight refresh first).
 """
 
 import logging
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
+from sqlmodel import col, select
 
 from app.auth import (
     create_access_token,
@@ -107,17 +124,18 @@ async def signup(
 
     try:
         await session.flush()
-    except IntegrityError:
+    except IntegrityError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="An account with this email already exists.",
-        )
+        ) from exc
 
     session.add(UserSettings(user_id=user.id))
     await session.flush()
     await session.refresh(user)
 
     tokens = await _issue_tokens(user, body.device_id, session)
+    await session.commit()
     logger.info("New user registered: %s", body.email)
     return tokens
 
@@ -132,7 +150,7 @@ async def signin(
 ) -> TokenResponse:
     """Authenticate an existing user and return an access + refresh token pair.
 
-    Accepts two input formats so both the Electron app (JSON) and the Swagger
+    Accepts two input formats so both the desktop app (JSON) and the Swagger
     UI "Authorize" dialog (OAuth2 form) work through the same route:
 
     - **JSON body**: ``{"email": "...", "password": "..."}``
@@ -164,15 +182,15 @@ async def signin(
     # Resolve credentials from whichever input format was sent
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
-        # JSON body — used by the Electron app
+        # JSON body — used by the desktop app
         try:
             raw = await request.json()
             json_body = SigninRequest(**raw)
-        except Exception:
+        except Exception as exc:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Invalid JSON body.",
-            )
+            ) from exc
         email: str = json_body.email
         plain_password: str = json_body.password
         device_id: str | None = json_body.device_id
@@ -193,7 +211,9 @@ async def signin(
     if user is None or not verify_password(plain_password, user.hashed_password):
         raise invalid_exc
 
-    return await _issue_tokens(user, device_id, session)
+    tokens = await _issue_tokens(user, device_id, session)
+    await session.commit()
+    return tokens
 
 
 @router.post("/refresh", response_model=TokenResponse)
@@ -207,7 +227,7 @@ async def refresh(
     pair is issued. This limits the damage if a refresh token is ever leaked —
     the attacker can only use it once before the legitimate client rotates it.
 
-    The Electron app should:
+    The desktop app should:
     1. Catch a 401 on any API call.
     2. Call ``POST /auth/refresh`` with the stored refresh token.
     3. If successful, store the new tokens and retry the original request.
@@ -221,53 +241,42 @@ async def refresh(
         A new ``TokenResponse`` with rotated access and refresh tokens.
 
     Raises:
-        HTTPException 401: If the token is not found, already revoked, or expired.
+        HTTPException 401: If the token is not found, already revoked, or
+            expired (including losing a concurrent refresh race).
     """
-    from datetime import UTC, datetime  # local import — only needed here
-
-    result = await session.execute(
-        select(RefreshToken).where(RefreshToken.token == body.refresh_token)
+    invalid_exc = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid, expired or revoked refresh token. Please sign in again.",
+        headers={"WWW-Authenticate": "Bearer"},
     )
-    stored = result.scalar_one_or_none()
 
-    if stored is None or stored.revoked:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or revoked refresh token.",
-            headers={"WWW-Authenticate": "Bearer"},
+    # Atomic claim: only one caller can flip revoked false → true.
+    claim = (
+        update(RefreshToken)
+        .where(
+            col(RefreshToken.token) == body.refresh_token,
+            col(RefreshToken.revoked).is_(False),
+            col(RefreshToken.expires_at) > datetime.now(UTC),
         )
-
-    # Make stored.expires_at timezone-aware for comparison if stored naive
-    expires_at = stored.expires_at
-    if expires_at.tzinfo is None:
-        from datetime import timezone
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-
-    if expires_at < datetime.now(UTC):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Refresh token has expired. Please sign in again.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    # Revoke the current token (rotation — use-once semantics)
-    stored.revoked = True
-    session.add(stored)
-    await session.flush()
-
-    # Fetch the user and issue a fresh pair
-    user_result = await session.execute(
-        select(User).where(User.id == stored.user_id)
+        .values(revoked=True)
+        .returning(col(RefreshToken.user_id), col(RefreshToken.device_id))
+        .execution_options(synchronize_session=False)
     )
+    rows = (await session.execute(claim)).all()
+    if len(rows) != 1:
+        await session.rollback()
+        raise invalid_exc
+    user_id, device_id = rows[0]
+
+    user_result = await session.execute(select(User).where(User.id == user_id))
     user = user_result.scalar_one_or_none()
     if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User no longer exists.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        await session.rollback()
+        raise invalid_exc
 
-    return await _issue_tokens(user, stored.device_id, session)
+    tokens = await _issue_tokens(user, device_id, session)
+    await session.commit()
+    return tokens
 
 
 @router.post("/signout", status_code=status.HTTP_204_NO_CONTENT)
@@ -298,5 +307,5 @@ async def signout(
     if stored is not None and not stored.revoked:
         stored.revoked = True
         session.add(stored)
-        await session.flush()
+        await session.commit()
         logger.info("Refresh token revoked for user_id=%s", stored.user_id)

@@ -43,10 +43,10 @@ from typing import NamedTuple
 
 from sqlalchemy import select, update
 
+from app.config import settings
 from app.db import AsyncSessionLocal
 from app.models.models import Conversation, ConversationMessage
 from app.services.llm_client import groq_client
-from app.config import settings
 
 logger = logging.getLogger(__name__)
 

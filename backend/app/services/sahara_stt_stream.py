@@ -31,7 +31,7 @@ Audio format required by Sahara
   - Sample rate: 16 000 Hz
   - Channels: mono (1)
   - Chunk size: 1 KB – 32 KB per message
-  - The audio coming from the Electron client is WebM (Opus).
+  - The audio coming from the desktop client is WebM (Opus).
     Convert to PCM16 LE with ffmpeg before streaming:
       ffmpeg -i audio.webm -f s16le -ar 16000 -ac 1 -
 
@@ -74,11 +74,11 @@ _COMMIT_TIMEOUT_S: float = 15.0
 def _webm_to_pcm16(webm_bytes: bytes) -> bytes:
     """Convert WebM/Opus audio to PCM 16-bit LE 16 kHz mono via ffmpeg.
 
-    The Electron MediaRecorder produces WebM audio.  Sahara streaming STT
+    The the desktop MediaRecorder produces WebM audio.  Sahara streaming STT
     expects raw PCM16 LE samples — no container, no header.
 
     Args:
-        webm_bytes: Raw WebM bytes from Electron MediaRecorder.
+        webm_bytes: Raw WebM bytes from the desktop MediaRecorder.
 
     Returns:
         Raw PCM16 LE bytes at 16 kHz mono.
@@ -125,7 +125,7 @@ async def stream_transcribe(
     caller can fall back to Groq Whisper without crashing.
 
     Args:
-        webm_bytes: Raw WebM audio from Electron MediaRecorder.
+        webm_bytes: Raw WebM audio from the desktop MediaRecorder.
         language: Hover AI language code (e.g. ``"en-pidgin"``).
         partial_callback: Optional async callable called with each partial
             transcript string as it arrives.

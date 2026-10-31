@@ -1,6 +1,10 @@
 """Authentication schemas — request bodies and response models for auth routes."""
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
+
+# bcrypt hashes only the first 72 bytes and bcrypt>=5 raises beyond that (B3).
+# Multibyte characters mean 72 *characters* can exceed this, so check bytes.
+_MAX_PASSWORD_BYTES = 72
 
 
 class SignupRequest(BaseModel):
@@ -21,6 +25,27 @@ class SignupRequest(BaseModel):
     password: str = Field(min_length=8, max_length=128)
     language: str = "en-pidgin"
     device_id: str | None = None
+
+    @field_validator("password")
+    @classmethod
+    def _password_fits_bcrypt(cls, value: str) -> str:
+        """Reject passwords longer than bcrypt's 72-byte input limit.
+
+        Args:
+            value: The submitted password.
+
+        Returns:
+            The password unchanged.
+
+        Raises:
+            ValueError: If the UTF-8 encoding exceeds 72 bytes (→ HTTP 422).
+        """
+        if len(value.encode()) > _MAX_PASSWORD_BYTES:
+            raise ValueError(
+                "Password is too long — use at most 72 bytes "
+                "(fewer characters if it contains accents or emoji)."
+            )
+        return value
 
 
 class SigninRequest(BaseModel):
@@ -65,7 +90,7 @@ class TokenResponse(BaseModel):
         access_token: Short-lived signed JWT (15 min). Attach as
             ``Authorization: Bearer <token>`` on every API request.
         refresh_token: Long-lived opaque token (90 days). Store securely
-            (e.g. Electron ``safeStorage``). Use ``POST /auth/refresh`` to
+            (e.g. the OS keychain). Use ``POST /auth/refresh`` to
             obtain a new access token when the current one expires.
         token_type: Always ``"bearer"`` per OAuth2 convention.
     """

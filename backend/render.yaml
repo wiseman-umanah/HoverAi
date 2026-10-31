@@ -1,20 +1,27 @@
 services:
   - type: web
     name: hover-ai-backend
-    runtime: python
+    runtime: docker
     region: oregon
     plan: free
 
     # ── Build ──────────────────────────────────────────────────────────────────
-    # Install ffmpeg (required by pydub for audio format conversion), then
-    # install Python dependencies with uv into the default virtualenv location.
-    buildCommand: |
-      apt-get install -y ffmpeg &&
-      pip install uv &&
-      uv sync --frozen
+    # The Dockerfile pins Python 3.12, installs ffmpeg (legacy WebM uploads) and
+    # installs dependencies from uv.lock. Paths are relative to rootDir.
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    # The image's CMD runs `uv run --no-sync hover`, binding 0.0.0.0:$PORT.
 
-    # ── Start ─────────────────────────────────────────────────────────────────
-    startCommand: uv run hover
+    # ── Migrations ────────────────────────────────────────────────────────────
+    # Schema changes are applied with Alembic, never at app startup.
+    # Pre-deploy commands need a paid instance type; on the free plan run this
+    # from the Render Shell (or locally against the external DB URL) before
+    # deploying a release that adds a migration:
+    #   uv run --no-sync alembic upgrade head
+    # First time only, for a database created before Alembic:
+    #   uv run --no-sync alembic stamp 0001_baseline
+    # preDeployCommand: uv run --no-sync alembic upgrade head
 
     # ── Health check ──────────────────────────────────────────────────────────
     healthCheckPath: /api/v1/health
@@ -44,16 +51,7 @@ services:
       - key: INTRON_STT_BASE_URL
         value: https://infer.voice.intron.io
 
-      - key: SAHARA_POLL_INTERVAL_S
-        value: "1.0"
-
-      - key: SAHARA_POLL_TIMEOUT_S
-        value: "60.0"
-
       - key: GROQ_API_KEY
-        sync: false
-
-      - key: HF_API_KEY
         sync: false
 
       - key: VISION_MODEL
@@ -62,8 +60,11 @@ services:
       - key: WHISPER_MODEL
         value: whisper-large-v3
 
-      - key: HF_ASR_MODEL
-        value: openai/whisper-large-v3
+      - key: VISION_JSON_MODE
+        value: "true"
+
+      - key: VISION_MARKED_MAX_EDGE
+        value: "1280"
 
       - key: TTS_MODEL
         value: canopylabs/orpheus-v1-english
@@ -73,3 +74,16 @@ services:
 
       - key: TTS_ENABLED
         value: "true"
+
+      - key: TTS_TIMEOUT_S
+        value: "8"
+
+      - key: SAHARA_TTS_ENABLED
+        value: "true"
+
+      - key: SAHARA_STT_STREAM_ENABLED
+        value: "false"
+
+      - key: LOG_LEVEL
+        value: INFO
+      # PORT is injected by Render automatically.
