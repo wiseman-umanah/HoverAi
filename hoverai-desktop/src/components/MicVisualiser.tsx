@@ -6,87 +6,53 @@ const BAR_WIDTH = 4
 const MIN_H = 3   // px — resting height
 const MAX_H = 36  // px — peak height
 
-// Maps a frequency bin value (0–255) to a bar height with a little curve
-function toHeight(value: number): number {
-  const normalised = value / 255
-  // Slight power curve so quiet sounds still move the bars noticeably
-  return MIN_H + (MAX_H - MIN_H) * Math.pow(normalised, 0.6)
-}
-
+/**
+ * Live microphone bars for the onboarding mic test.
+ *
+ * The mic is opened natively by Rust (`mic_monitor_start`), not with
+ * getUserMedia — WebKitGTK on Linux denies webview media access. Rust emits
+ * `audio-level` events (0–1); the bars scroll that level history.
+ */
 export default function MicVisualiser() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const rafRef = useRef<number>(0)
-  const analyserRef = useRef<AnalyserNode | null>(null)
-  const streamRef = useRef<MediaStream | null>(null)
 
   useEffect(() => {
-    let cancelled = false
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const c = canvas.getContext('2d')!
+    const levels: number[] = new Array(BAR_COUNT).fill(0)
+    let target = 0
+    let rafId = 0
 
-    async function start() {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop())
-          return
-        }
-        streamRef.current = stream
+    const unsub = window.api.onAudioLevel((l) => { target = l })
+    window.api.micMonitorStart().catch((err) => console.warn('[mic] monitor failed:', err))
 
-        const ctx = new AudioContext()
-        const source = ctx.createMediaStreamSource(stream)
-        const analyser = ctx.createAnalyser()
-        analyser.fftSize = 128          // 64 frequency bins — enough for BAR_COUNT
-        analyser.smoothingTimeConstant = 0.78  // smooths rapid changes
-        source.connect(analyser)
-        analyserRef.current = analyser
+    function draw() {
+      rafId = requestAnimationFrame(draw)
+      const next = levels[levels.length - 1] * 0.5 + target * 0.5
+      levels.shift(); levels.push(next)
 
-        const data = new Uint8Array(analyser.frequencyBinCount)
-        const canvas = canvasRef.current
-        if (!canvas) return
-        const c = canvas.getContext('2d')!
-
-        function draw() {
-          if (cancelled || !analyserRef.current) return
-          rafRef.current = requestAnimationFrame(draw)
-
-          analyserRef.current.getByteFrequencyData(data)
-
-          const { width, height } = canvas!
-          c.clearRect(0, 0, width, height)
-
-          // Sample BAR_COUNT bins evenly across the lower half of the spectrum
-          // (human voice lives roughly in the first 40% of bins)
-          const usableBins = Math.floor(data.length * 0.55)
-          const step = usableBins / BAR_COUNT
-
-          for (let i = 0; i < BAR_COUNT; i++) {
-            const binIndex = Math.floor(i * step)
-            const h = toHeight(data[binIndex])
-            const x = i * (BAR_WIDTH + BAR_GAP)
-            const y = (height - h) / 2  // centre bars vertically
-
-            // Colour: accent purple, opacity driven by height
-            const alpha = 0.35 + 0.65 * ((h - MIN_H) / (MAX_H - MIN_H))
-            c.fillStyle = `rgba(108, 99, 255, ${alpha.toFixed(2)})`
-            c.beginPath()
-            c.roundRect(x, y, BAR_WIDTH, h, 2)
-            c.fill()
-          }
-        }
-
-        draw()
-      } catch {
-        // mic already granted but something went wrong — silently no-op
-      }
+      const { width, height } = canvas!
+      c.clearRect(0, 0, width, height)
+      levels.forEach((pct, i) => {
+        // Slight power curve so quiet sounds still move the bars noticeably
+        const h = MIN_H + (MAX_H - MIN_H) * Math.pow(pct, 0.6)
+        const x = i * (BAR_WIDTH + BAR_GAP)
+        const y = (height - h) / 2  // centre bars vertically
+        // Colour: accent purple, opacity driven by height
+        const alpha = 0.35 + 0.65 * ((h - MIN_H) / (MAX_H - MIN_H))
+        c.fillStyle = `rgba(108, 99, 255, ${alpha.toFixed(2)})`
+        c.beginPath()
+        c.roundRect(x, y, BAR_WIDTH, h, 2)
+        c.fill()
+      })
     }
-
-    start()
+    draw()
 
     return () => {
-      cancelled = true
-      cancelAnimationFrame(rafRef.current)
-      streamRef.current?.getTracks().forEach((t) => t.stop())
-      streamRef.current = null
-      analyserRef.current = null
+      cancelAnimationFrame(rafId)
+      unsub()
+      window.api.micMonitorStop()
     }
   }, [])
 

@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "dev:wake": "tauri dev --features wake-word",
     "typecheck": "tsc --noEmit",
     "build:win": "pnpm typecheck && tauri build --target x86_64-pc-windows-msvc",
     "build:mac": "pnpm typecheck && tauri build --target aarch64-apple-darwin",

@@ -1,7 +1,7 @@
 /**
  * Typed API client for the HoverAI backend.
  *
- * - All calls include `Authorization: Bearer <access_token>` from safeStorage via IPC.
+ * - All calls include `Authorization: Bearer <access_token>` from the OS keychain via Tauri IPC.
  * - On 401, the client automatically calls POST /auth/refresh, stores the new
  *   token pair, and retries the original request once.
  * - If the refresh also fails, `AuthExpiredError` is thrown — the caller should
@@ -9,7 +9,7 @@
  */
 
 // Renderer process: Vite replaces import.meta.env.VITE_API_BASE at build time.
-// Falls back to localhost for safety — override via hover-app/.env
+// Falls back to localhost for safety — override via hoverai-desktop/.env
 export const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000/api/v1'
 
 
@@ -110,8 +110,9 @@ async function request<T>(
     ...(fetchOptions.headers as Record<string, string>),
   }
 
+  let token: string | null = null
   if (!skipAuth) {
-    const token = await window.api.getAccessToken()
+    token = await window.api.getAccessToken()
     if (token) headers['Authorization'] = `Bearer ${token}`
   }
 
@@ -119,7 +120,7 @@ async function request<T>(
 
   // ── 401 → refresh → retry once ───────────────────────────────────────────
   if (resp.status === 401 && !skipAuth) {
-    const refreshed = await tryRefresh()
+    const refreshed = await tryRefresh(token)
     if (!refreshed) throw new AuthExpiredError()
 
     const retryHeaders = { ...headers, Authorization: `Bearer ${refreshed}` }
@@ -158,12 +159,13 @@ async function parseResponse<T>(resp: Response): Promise<T> {
   return body as T
 }
 
-async function tryRefresh(): Promise<string | null> {
-  // Delegates to main process via the refresh-tokens IPC channel.
-  // Main holds the refresh token in safeStorage and performs the actual
-  // /auth/refresh call, stores the new pair, and returns the new access token.
+async function tryRefresh(rejected: string | null): Promise<string | null> {
+  // Delegates to Rust via the refresh_tokens command. Rust holds the refresh
+  // token in the OS keychain and serialises refreshes, so passing the token
+  // that was rejected lets it return an already-refreshed one instead of
+  // rotating twice.
   try {
-    return await window.api.refreshTokens()
+    return await window.api.refreshTokens(rejected)
   } catch {
     return null
   }
@@ -185,15 +187,6 @@ async function signin(body: SigninPayload): Promise<TokenResponse> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    skipAuth: true,
-  })
-}
-
-async function signout(refreshToken: string): Promise<void> {
-  return request<void>('/auth/signout', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ refresh_token: refreshToken }),
     skipAuth: true,
   })
 }
@@ -241,7 +234,6 @@ async function getLanguages(): Promise<Language[]> {
 export const api = {
   signup,
   signin,
-  signout,
   getMe,
   patchMe,
   getServerSettings,

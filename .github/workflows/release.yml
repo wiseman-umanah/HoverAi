@@ -77,6 +77,12 @@ jobs:
             libglib2.0-dev \
             libasound2-dev \
             libsecret-1-dev \
+            libpipewire-0.3-dev \
+            libclang-dev \
+            libwayland-dev \
+            libxcb1-dev \
+            libgbm-dev \
+            libegl1-mesa-dev \
             pkg-config
 
       # ── 5. Write .env (API base URL comes from a repository secret) ───────────

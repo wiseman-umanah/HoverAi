@@ -12,7 +12,7 @@
 //     → every 500 ms drain native samples, linear-interpolate to 16 kHz
 //     → maintain rolling 2-second window (32 000 samples at 16 kHz)
 //     → WakeWordModel::predict() on the full window
-//     → score > threshold → trigger_capture() + 1.5 s cooldown
+//     → score > threshold → trigger_from_wake_word() + 1.5 s cooldown
 //
 // Stopping: drop the SyncSender returned by start(). The detector thread
 // checks the channel every loop iteration and exits cleanly, which drops
@@ -259,7 +259,7 @@ fn run_detector(
                             println!("[wake-word] *** DETECTED *** score={score:.3}");
                             let app_clone = app.clone();
                             tauri::async_runtime::spawn(async move {
-                                crate::trigger_capture(app_clone).await;
+                                crate::trigger_from_wake_word(app_clone).await;
                             });
                         }
                     }

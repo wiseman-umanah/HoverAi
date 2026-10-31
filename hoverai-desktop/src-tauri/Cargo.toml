@@ -5,6 +5,13 @@ description = "HoverAI — AI-powered on-screen assistant"
 authors = ["HoverAI"]
 edition = "2021"
 
+[features]
+default = []
+# "Hey Hover" wake word. Off by default: pulls in ~120 extra crates including
+# ONNX Runtime, which downloads native binaries at build time and has no
+# prebuilt binary for Intel macOS. Enable with `pnpm dev:wake`.
+wake-word = ["dep:livekit-wakeword"]
+
 [lib]
 name = "hoverai_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -23,16 +30,42 @@ tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"], default-features = false }
-tokio = { version = "1", features = ["full"] }
+# Only tokio::time::sleep is used directly; Tauri brings its own runtime.
+tokio = { version = "1", features = ["time", "sync"] }
 base64 = "0.22"
-screenshots = "0.8"
 
-# Wake-word detection
-livekit-wakeword = "0.1"
+# Microphone capture (query recording + optional wake word)
 cpal = "0.15"
+
+# Wake-word detection — only compiled with `--features wake-word` (see [features])
+livekit-wakeword = { version = "0.1", optional = true }
 
 # OS credential store (Windows Credential Manager / macOS Keychain / Linux Secret Service)
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native"] }
+
+# Screen capture (X11, Wayland via wlr-screencopy/portal, Windows, macOS) + JPEG encoding
+xcap = "0.9"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# Lifecycle + diagnostics
+tauri-plugin-single-instance = "2"
+tauri-plugin-log = "2"
+log = "0.4"
+
+# ── Local development (pnpm tauri dev / cargo check) ─────────────────────────
+# Line-level debug info for our crate only; none for dependencies. Cuts target/
+# size by several GB and speeds up linking, while backtraces keep line numbers.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# Screenshot capture/resize/JPEG encoding is very slow unoptimised; optimise just these crates.
+[profile.dev.package.xcap]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
 
 # ── Production release (used by CI / pnpm build:win|mac|linux) ───────────────
 # Full LTO + single codegen unit → smallest binary, slowest compile (~45 min)
@@ -50,3 +83,20 @@ strip = true
 inherits = "release"
 codegen-units = 16
 lto = false
+
+# Linux: GDK input regions for the overlay's click-through areas (same gtk as Tauri)
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "global_shortcuts"] }
+futures-util = { version = "0.3", default-features = false }
+gtk = "0.18"
+# Accessibility snapshot (src/a11y/linux.rs): raw AT-SPI calls over D-Bus. Same
+# zbus 5 already pulled in by xcap/ashpd; a private current-thread tokio runtime.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "time"] }
+
+# Accessibility snapshot (src/a11y/windows.rs): UI Automation
+[target.'cfg(target_os = "windows")'.dependencies]
+uiautomation = "0.25"
+# Same `windows` version uiautomation uses (HWND types must match): foreground
+# window + owning process name.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }

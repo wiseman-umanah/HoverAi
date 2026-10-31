@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (ruff + pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      # Python version comes from backend/.python-version (3.12).
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Ruff
+        run: uv run ruff check app tests
+
+      # Tests need no .env or network: tests/conftest.py sets dummy keys and an
+      # in-memory SQLite DATABASE_URL. ffmpeg-dependent tests skip if absent.
+      - name: Pytest
+        run: uv run pytest -q
+
+  desktop:
+    name: Desktop (tsc + clippy + tests)
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: hoverai-desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux deps (WebKitGTK, tray, ALSA, keyring, xcap/PipeWire)
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev libglib2.0-dev libasound2-dev libsecret-1-dev \
+            libpipewire-0.3-dev libclang-dev libwayland-dev libxcb1-dev \
+            libgbm-dev libegl1-mesa-dev pkg-config
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: hoverai-desktop/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hoverai-desktop/src-tauri
+
+      - name: Install JS deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      # Vite output must exist for tauri::generate_context!() to compile.
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Clippy (default features)
+        working-directory: hoverai-desktop/src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Unit tests
+        working-directory: hoverai-desktop/src-tauri
+        run: cargo test --lib --locked
+
+  # Windows is the primary target and has its own code paths (click-through
+  # poller, no portal), which the Linux job can't compile.
+  desktop-windows:
+    name: Desktop (Windows clippy)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: hoverai-desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: hoverai-desktop/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hoverai-desktop/src-tauri
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Clippy (default features)
+        working-directory: hoverai-desktop/src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings

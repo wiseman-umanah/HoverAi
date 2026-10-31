@@ -1,17 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
+import { displayShortcut, formatCombo, toAccelerator } from '@renderer/lib/shortcuts'
 
 interface ShortcutPageProps {
   onComplete: () => void
 }
 
 type Status = 'waiting' | 'testing' | 'available' | 'taken' | 'confirmed'
-
-// Keys that can never be part of a valid accelerator
-const MODIFIER_KEYS = new Set([
-  'Control', 'Shift', 'Alt', 'Meta', 'Super', 'Hyper',
-  'Unidentified', 'Dead', 'Process',
-])
 
 // Suggestions to probe on mount — ordered from "most likely free" to "less likely"
 const SUGGESTIONS = [
@@ -26,34 +21,18 @@ const SUGGESTIONS = [
 
 // Human-readable label for a suggestion
 function suggestLabel(acc: string): string {
-  return acc.replace('CommandOrControl', 'Ctrl').replace(/\+/g, ' + ')
-}
-
-// Convert a KeyboardEvent into a display string like "Ctrl+Shift+Space"
-// Returns '' if the combo is incomplete or invalid
-function formatCombo(e: KeyboardEvent): string {
-  if (MODIFIER_KEYS.has(e.key)) return ''
-  if (!e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) return ''
-
-  const parts: string[] = []
-  if (e.ctrlKey || e.metaKey) parts.push('Ctrl')
-  if (e.altKey) parts.push('Alt')
-  if (e.shiftKey) parts.push('Shift')
-  const key = e.key === ' ' ? 'Space' : e.key.length === 1 ? e.key.toUpperCase() : e.key
-  if (!key || key === 'Unidentified') return ''
-  parts.push(key)
-  return parts.join('+')
-}
-
-// Convert display string to Electron accelerator
-function toAccelerator(combo: string): string {
-  return combo.replace('Ctrl', 'CommandOrControl').replace('Meta', 'CommandOrControl')
+  return displayShortcut(acc).replace(/\+/g, ' + ')
 }
 
 export default function ShortcutPage({ onComplete }: ShortcutPageProps) {
   const [combo, setCombo] = useState('')
   const [status, setStatus] = useState<Status>('waiting')
   const [suggestions, setSuggestions] = useState<Record<string, boolean>>({})
+  const [wayland, setWayland] = useState(false)
+
+  useEffect(() => {
+    window.api.platformInfo().then((p) => setWayland(p.wayland)).catch(() => {})
+  }, [])
   const ease = [0.22, 1, 0.36, 1] as const
   const testingRef = useRef(false)
   // Keep a stable ref to handleConfirm so the keydown listener can call it
@@ -116,7 +95,7 @@ export default function ShortcutPage({ onComplete }: ShortcutPageProps) {
   confirmRef.current = handleConfirm
 
   async function pickSuggestion(acc: string) {
-    const display = acc.replace('CommandOrControl', 'Ctrl')
+    const display = displayShortcut(acc)
     setCombo(display)
     setStatus('testing')
     const ok = await window.api.testShortcut(acc).catch(() => false)
@@ -166,10 +145,15 @@ export default function ShortcutPage({ onComplete }: ShortcutPageProps) {
           Set your capture shortcut
         </h1>
         <p style={{ fontSize: 15, color: 'var(--text-secondary)', lineHeight: 1.6, maxWidth: 500 }}>
-          Your shortcut is always the reliable fallback — it works even when the
-          wake word isn&apos;t heard or the mic is in use. Press any key combination,
+          This is how you call Hover from any app. Press any key combination,
           or pick a free suggestion below.
         </p>
+        {wayland && (
+          <p style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.6, maxWidth: 520, marginTop: 10 }}>
+            On Wayland your desktop may ask you to confirm this shortcut. On Hyprland, bind it in
+            your config instead: <code>bind = SUPER SHIFT, H, global, com.hoverai.desktop:capture</code>
+          </p>
+        )}
       </motion.div>
 
       {/* Key recorder */}

@@ -3,43 +3,9 @@ import { motion } from 'framer-motion'
 import type { AppSettings } from '@renderer/lib/settings-types'
 import LangDropdown, { toDropdownLanguage, type Language } from '@renderer/components/LangDropdown'
 import { api, ApiError } from '@renderer/lib/api'
+import { displayShortcut, formatCombo, toAccelerator } from '@renderer/lib/shortcuts'
 import type { UserResponse, ConversationHistory, ConversationDay, ConversationMessage } from '@renderer/lib/api'
 import { onWakeWordError, setLaunchAtLogin } from '@renderer/lib/tauri-api'
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-const MODIFIER_KEYS = new Set([
-  'Control',
-  'Shift',
-  'Alt',
-  'Meta',
-  'Super',
-  'Hyper',
-  'Unidentified',
-  'Dead',
-  'Process',
-])
-
-function formatCombo(e: KeyboardEvent): string {
-  if (MODIFIER_KEYS.has(e.key)) return ''
-  if (!e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) return ''
-  const parts: string[] = []
-  if (e.ctrlKey || e.metaKey) parts.push('Ctrl')
-  if (e.altKey) parts.push('Alt')
-  if (e.shiftKey) parts.push('Shift')
-  const key = e.key === ' ' ? 'Space' : e.key.length === 1 ? e.key.toUpperCase() : e.key
-  if (!key || key === 'Unidentified') return ''
-  parts.push(key)
-  return parts.join('+')
-}
-
-function toAccelerator(combo: string): string {
-  return combo.replace('Ctrl', 'CommandOrControl').replace('Meta', 'CommandOrControl')
-}
-
-function displayShortcut(acc: string): string {
-  return acc.replace('CommandOrControl', 'Ctrl')
-}
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
@@ -58,6 +24,11 @@ export default function SettingsPage() {
   >('idle')
   const testingRef = useRef(false)
   const [wakeWordError, setWakeWordError] = useState<string | null>(null)
+  const [wakeWordAvailable, setWakeWordAvailable] = useState(false)
+
+  useEffect(() => {
+    window.api.wakeWordAvailable().then(setWakeWordAvailable).catch(() => {})
+  }, [])
   const [autostartError, setAutostartError] = useState<string | null>(null)
 
   // Subscribe to wake-word errors from Rust (mic permission denied, device missing, etc.)
@@ -151,8 +122,12 @@ export default function SettingsPage() {
       setShortcutStatus(available ? 'available' : 'taken')
       testingRef.current = false
       if (available) {
-        await window.api.registerShortcutFromSettings(acc).catch(() => false)
-        setShortcutStatus('idle')
+        const ok = await window.api.registerShortcutFromSettings(acc).catch(() => false)
+        setShortcutStatus(ok ? 'idle' : 'taken')
+        // Show what Rust actually has registered — the old shortcut stays
+        // active if the new one failed.
+        const active = await window.api.getActiveShortcut().catch(() => '')
+        if (active) setShortcutCombo(displayShortcut(active))
       }
     }
     window.addEventListener('keydown', onKeyDown)
@@ -437,7 +412,8 @@ export default function SettingsPage() {
           />
         </Card>
 
-        {/* ── Always-on wake word ─────────────────────────────────────── */}
+        {/* ── Always-on wake word (only in builds with the wake-word feature) ── */}
+        {wakeWordAvailable && (
         <Card>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
             <div>
@@ -459,6 +435,7 @@ export default function SettingsPage() {
             </p>
           )}
         </Card>
+        )}
 
         {/* ── Voice gender ─────────────────────────────────────────────── */}
         <Card>
@@ -593,6 +570,36 @@ export default function SettingsPage() {
               }}
             >
               Sign Out
+            </button>
+          </div>
+        </Card>
+
+        {/* ── Quit ────────────────────────────────────────────────────── */}
+        <Card>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+            <div>
+              <p style={{ fontSize: 16, fontWeight: 700, color: 'var(--text-primary)' }}>
+                Quit HoverAI
+              </p>
+              <p style={{ fontSize: 14, color: 'var(--text-secondary)', marginTop: 3 }}>
+                Closing this window keeps HoverAI running in the tray. Quit stops it completely.
+              </p>
+            </div>
+            <button
+              onClick={() => window.api.quitApp()}
+              style={{
+                padding: '9px 18px',
+                borderRadius: 'var(--radius-full)',
+                border: '1px solid rgba(239,68,68,0.35)',
+                background: 'rgba(239,68,68,0.08)',
+                color: '#f87171',
+                fontSize: 14,
+                fontWeight: 600,
+                cursor: 'pointer',
+                flexShrink: 0,
+              }}
+            >
+              Quit
             </button>
           </div>
         </Card>

@@ -23,7 +23,6 @@ dist-ssr
 *.sln
 *.sw?
 .bob/
-AGENTS.md
 dump.txt
 __pycache__
 .venv

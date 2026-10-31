@@ -1,14 +1,33 @@
 // ─── HoverAI Tauri backend ────────────────────────────────────────────────────
-// Replaces hover-app/src/main/index.ts entirely.
 // All IPC is via #[tauri::command] (invoke) or app_handle.emit() (push events).
+//
+// Capture session (owned here, the overlay webview only renders it):
+//
+//   Idle ──trigger──▶ Recording ──submit / trigger──▶ Thinking ──result──▶ Showing
+//    ▲                   │ cancel / Esc                  │ cancel / Esc        │ cancel / Esc / trigger
+//    └───────────────────┴───────────────────────────────┴─────────────────────┘
+//
+// Every capture gets a new session id; results and errors for an older id
+// are dropped, so a late response can never re-open a dismissed overlay.
 
-mod tokens;
+mod a11y;
+mod audio;
+mod auth;
+mod capture;
+mod context;
+mod hit_region;
+mod marks;
 mod settings;
-mod http_client;
+mod tokens;
+#[cfg(feature = "wake-word")]
 mod wake_word;
+#[cfg(target_os = "linux")]
+mod wayland_shortcut;
 
 use std::sync::Mutex;
-use base64::Engine;
+use std::time::Duration;
+
+use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -17,6 +36,8 @@ use tauri::{
     AppHandle, Emitter, Manager, WebviewWindow,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+
+use auth::{AuthError, Authed};
 
 // ─── API base URL ─────────────────────────────────────────────────────────────
 
@@ -29,38 +50,44 @@ pub fn api_base() -> String {
         .to_string()
 }
 
+const QUERY_TIMEOUT: Duration = Duration::from_secs(90);
+const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+const ESCAPE: &str = "Escape";
+
 // ─── Shared state ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Phase {
+    Idle,
+    Recording,
+    Thinking,
+    Showing,
+}
+
+struct Session {
+    id: u64,
+    phase: Phase,
+}
 
 struct AppState {
     active_shortcut: Mutex<String>,
-    last_screenshot: Mutex<String>,  // base64 PNG dataUrl
-    http_client: Client,
+    http: Client,
+    session: Mutex<Session>,
+    /// Mic recording for the current capture session.
+    recording: Mutex<Option<audio::Recording>>,
+    /// Marked screenshot + screen context taken when the current capture started.
+    screenshot: Mutex<Option<capture::MarkedScreenshot>>,
+    /// Level-only mic stream for the onboarding microphone test.
+    mic_monitor: Mutex<Option<audio::Recording>>,
+    /// Interactive rectangles reported by the overlay (CSS px); see hit_region.rs.
+    hit_regions: Mutex<Vec<hit_region::Rect>>,
     /// When Some, the wake-word detector is running. Drop or send to stop it.
+    #[cfg(feature = "wake-word")]
     wake_word_stop: Mutex<Option<std::sync::mpsc::SyncSender<wake_word::StopSignal>>>,
 }
 
-// ─── Screenshots ──────────────────────────────────────────────────────────────
-
-/// Capture the screen under the current cursor position.
-/// Returns a base64-encoded PNG (without data: prefix).
-fn capture_screenshot_b64() -> Result<String, String> {
-    use screenshots::Screen;
-    use std::io::Cursor;
-    let screens = Screen::all().map_err(|e| format!("screen list error: {e}"))?;
-    // Pick primary screen — multi-monitor refinement can follow
-    let screen = screens.into_iter().next().ok_or("no screens found")?;
-    let image = screen.capture().map_err(|e| format!("capture error: {e}"))?;
-    // screenshots returns an ImageBuffer<Rgba<u8>>; encode it as PNG via the `image` crate
-    let mut buf = Cursor::new(Vec::new());
-    image.write_to(&mut buf, screenshots::image::ImageFormat::Png)
-        .map_err(|e| format!("png encode error: {e}"))?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(buf.into_inner()))
-}
-
-/// Returns a data: URL suitable for passing to the renderer.
-fn capture_screenshot_data_url() -> Result<String, String> {
-    let b64 = capture_screenshot_b64()?;
-    Ok(format!("data:image/png;base64,{b64}"))
+fn state(app: &AppHandle) -> &AppState {
+    app.state::<AppState>().inner()
 }
 
 // ─── Overlay window helpers ───────────────────────────────────────────────────
@@ -73,70 +100,280 @@ fn get_settings_win(app: &AppHandle) -> Option<WebviewWindow> {
     app.get_webview_window("settings")
 }
 
-// ─── Trigger capture ──────────────────────────────────────────────────────────
+fn cursor_point(app: &AppHandle) -> Option<(i32, i32)> {
+    app.cursor_position().ok().map(|p| (p.x as i32, p.y as i32))
+}
 
-async fn trigger_capture(app: AppHandle) {
-    let state = app.state::<AppState>();
+/// The point xcap expects: physical pixels everywhere except macOS (points).
+fn capture_point(app: &AppHandle, point: Option<(i32, i32)>) -> Option<(i32, i32)> {
+    #[cfg(target_os = "macos")]
+    {
+        point.map(|(x, y)| {
+            let scale = app
+                .monitor_from_point(x as f64, y as f64)
+                .ok()
+                .flatten()
+                .map(|m| m.scale_factor())
+                .unwrap_or(1.0);
+            ((x as f64 / scale) as i32, (y as f64 / scale) as i32)
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        point
+    }
+}
 
-    // If overlay is already visible, shortcut press dismisses it
-    if let Some(overlay) = get_overlay(&app) {
-        if overlay.is_visible().unwrap_or(false) {
-            let _ = overlay.hide();
-            let _ = overlay.set_ignore_cursor_events(true);
-            let _ = app.emit_to("overlay", "capture-end", ());
+/// Cover the monitor under `point` (or the primary monitor) with the overlay.
+/// Uses Tauri's monitor info, which is in physical pixels on every platform.
+fn place_overlay(app: &AppHandle, overlay: &WebviewWindow, point: Option<(i32, i32)>) {
+    let monitor = point
+        .and_then(|(x, y)| app.monitor_from_point(x as f64, y as f64).ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten());
+    if let Some(m) = monitor {
+        let _ = overlay.set_position(tauri::Position::Physical(*m.position()));
+        let _ = overlay.set_size(tauri::Size::Physical(*m.size()));
+    }
+}
+
+async fn show_overlay_focused(overlay: &WebviewWindow) {
+    let _ = overlay.set_always_on_top(true);
+    let _ = overlay.set_ignore_cursor_events(false);
+    hit_region::invalidate();
+    // show() MUST come before set_focus() — on Windows the OS will not give
+    // keyboard focus to a hidden window, and the short delay lets the
+    // compositor finish showing it. Esc no longer depends on this focus
+    // (it is a temporary global shortcut), it only helps Space/Enter.
+    let _ = overlay.show();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let _ = overlay.set_focus();
+}
+
+fn hide_overlay(app: &AppHandle) {
+    if let Some(o) = get_overlay(app) {
+        let _ = o.hide();
+        let _ = o.set_ignore_cursor_events(true);
+        hit_region::invalidate();
+    }
+}
+
+// ─── Temporary global Escape ──────────────────────────────────────────────────
+// While the overlay is up, Esc cancels it no matter which window has focus.
+
+fn register_escape(app: &AppHandle) {
+    let gs = app.global_shortcut();
+    if gs.is_registered(ESCAPE) {
+        return;
+    }
+    let handle = app.clone();
+    let res = gs.on_shortcut(ESCAPE, move |_app, _shortcut, event| {
+        if event.state() == ShortcutState::Pressed {
+            let h = handle.clone();
+            // Never touch shortcut registration from inside its own callback.
+            tauri::async_runtime::spawn(async move { cancel_capture(&h) });
+        }
+    });
+    if let Err(e) = res {
+        log::warn!("[overlay] could not register global Escape: {e}");
+    }
+}
+
+fn unregister_escape(app: &AppHandle) {
+    let gs = app.global_shortcut();
+    if gs.is_registered(ESCAPE) {
+        let _ = gs.unregister(ESCAPE);
+    }
+}
+
+// ─── Capture session ──────────────────────────────────────────────────────────
+
+fn phase(app: &AppHandle) -> Phase {
+    state(app).session.lock().unwrap().phase
+}
+
+/// True if session `id` is still current and in `expected` phase.
+fn is_current(app: &AppHandle, id: u64, expected: Phase) -> bool {
+    let s = state(app).session.lock().unwrap();
+    s.id == id && s.phase == expected
+}
+
+/// Shortcut / `--trigger` / tray entry point. Toggles through the session.
+pub async fn trigger_capture(app: AppHandle) {
+    match phase(&app) {
+        Phase::Idle => start_capture(app).await,
+        Phase::Recording => submit_capture(app).await,
+        Phase::Thinking | Phase::Showing => cancel_capture(&app),
+    }
+}
+
+/// The wake word only ever starts a capture; it never cancels one.
+#[cfg(feature = "wake-word")]
+pub async fn trigger_from_wake_word(app: AppHandle) {
+    if phase(&app) == Phase::Idle {
+        start_capture(app).await;
+    }
+}
+
+async fn start_capture(app: AppHandle) {
+    let id = {
+        let mut s = state(&app).session.lock().unwrap();
+        if s.phase != Phase::Idle {
+            return;
+        }
+        s.id += 1;
+        s.phase = Phase::Recording;
+        s.id
+    };
+    log::info!("[capture] #{id} start");
+    if let Some(m) = state(&app).mic_monitor.lock().unwrap().take() {
+        m.cancel();
+    }
+
+    // Screenshot BEFORE the overlay is shown, off the async runtime.
+    let point = cursor_point(&app);
+    let cap_point = capture_point(&app, point);
+    let shot = tauri::async_runtime::spawn_blocking(move || capture::capture_with_context(cap_point))
+        .await
+        .unwrap_or_else(|e| Err(format!("capture task failed: {e}")));
+
+    let Some(overlay) = get_overlay(&app) else { return };
+    place_overlay(&app, &overlay, point);
+    register_escape(&app);
+
+    match shot {
+        Ok(s) => *state(&app).screenshot.lock().unwrap() = Some(s),
+        Err(e) => {
+            log::error!("[capture] #{id} {e}");
+            show_error(&app, id, format!("Couldn't capture your screen: {e}")).await;
+            return;
+        }
+    }
+    if !is_current(&app, id, Phase::Recording) {
+        return; // cancelled while capturing
+    }
+
+    let app_for_mic = app.clone();
+    let rec = tauri::async_runtime::spawn_blocking(move || audio::start(app_for_mic, true))
+        .await
+        .unwrap_or_else(|e| Err(format!("microphone task failed: {e}")));
+    match rec {
+        Ok(rec) => {
+            if !is_current(&app, id, Phase::Recording) {
+                rec.cancel();
+                return;
+            }
+            *state(&app).recording.lock().unwrap() = Some(rec);
+        }
+        Err(e) => {
+            log::error!("[capture] #{id} microphone: {e}");
+            show_error(&app, id, format!("Microphone unavailable: {e}")).await;
             return;
         }
     }
 
-    // Take screenshot BEFORE showing overlay
-    match capture_screenshot_data_url() {
-        Ok(data_url) => {
-            *state.last_screenshot.lock().unwrap() = data_url.clone();
-            let shortcut = state.active_shortcut.lock().unwrap().clone();
+    show_overlay_focused(&overlay).await;
+    let _ = app.emit_to("overlay", "capture-start", ());
+}
 
-            if let Some(overlay) = get_overlay(&app) {
-                // Resize overlay to cover the primary monitor exactly
-                if let Ok(screens) = screenshots::Screen::all() {
-                    if let Some(screen) = screens.into_iter().next() {
-                        let di = screen.display_info;
-                        let _ = overlay.set_position(tauri::Position::Physical(
-                            tauri::PhysicalPosition { x: di.x, y: di.y },
-                        ));
-                        let _ = overlay.set_size(tauri::Size::Physical(
-                            tauri::PhysicalSize { width: di.width, height: di.height },
-                        ));
-                    }
-                }
-                let _ = overlay.set_always_on_top(true);
-                // Ensure overlay receives mouse AND keyboard events
-                let _ = overlay.set_ignore_cursor_events(false);
-                // show() MUST come before set_focus() — on Windows the OS
-                // will not give keyboard focus to a hidden window.
-                let _ = overlay.show();
-                // Small delay lets the Windows compositor finish the show
-                // operation; without it set_focus() is sometimes ignored and
-                // Space/Enter never reach the webview's keydown handler.
-                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-                let _ = overlay.set_focus();
-                let _ = app.emit_to("overlay", "capture-start", CaptureStartPayload {
-                    data_url,
-                    shortcut_key: shortcut,
-                });
-            }
+async fn submit_capture(app: AppHandle) {
+    let id = {
+        let mut s = state(&app).session.lock().unwrap();
+        if s.phase != Phase::Recording {
+            return;
         }
+        s.phase = Phase::Thinking;
+        s.id
+    };
+    log::info!("[capture] #{id} submit");
+    let _ = app.emit_to("overlay", "capture-submitted", ());
+    // While thinking only a small progress bar is drawn; let clicks through.
+    if let Some(o) = get_overlay(&app) {
+        let _ = o.set_ignore_cursor_events(true);
+        hit_region::invalidate();
+    }
+
+    let rec = state(&app).recording.lock().unwrap().take();
+    let wav = match rec {
+        Some(r) => tauri::async_runtime::spawn_blocking(move || r.stop())
+            .await
+            .unwrap_or_else(|e| Err(format!("recording task failed: {e}"))),
+        None => Err("not recording".into()),
+    };
+    let wav = match wav {
+        Ok(w) => w,
         Err(e) => {
-            eprintln!("[capture] screenshot failed: {e}");
+            log::error!("[capture] #{id} audio: {e}");
+            show_error(
+                &app,
+                id,
+                "I couldn't hear anything — check that your microphone is on and not muted.".into(),
+            )
+            .await;
+            return;
         }
+    };
+    let Some(shot) = state(&app).screenshot.lock().unwrap().take() else {
+        show_error(&app, id, "The screenshot for this question was lost — please try again.".into())
+            .await;
+        return;
+    };
+
+    run_query(app, id, wav, shot).await;
+}
+
+/// Cancel/dismiss from any phase. Idempotent; emits `capture-end` so the
+/// overlay resets — the overlay must NOT call back into this on that event.
+fn cancel_capture(app: &AppHandle) {
+    let was = {
+        let mut s = state(app).session.lock().unwrap();
+        let was = s.phase;
+        s.id += 1; // invalidates any in-flight query
+        s.phase = Phase::Idle;
+        was
+    };
+    if let Some(r) = state(app).recording.lock().unwrap().take() {
+        std::thread::spawn(move || r.cancel());
+    }
+    state(app).screenshot.lock().unwrap().take();
+    state(app).hit_regions.lock().unwrap().clear();
+    unregister_escape(app);
+    hide_overlay(app);
+    let _ = app.emit_to("overlay", "capture-end", ());
+    if was != Phase::Idle {
+        log::info!("[capture] cancelled (was {was:?})");
     }
 }
 
-#[derive(Clone, Serialize)]
-struct CaptureStartPayload {
-    data_url: String,
-    shortcut_key: String,
+async fn show_error(app: &AppHandle, id: u64, message: String) {
+    {
+        let mut s = state(app).session.lock().unwrap();
+        if s.id != id {
+            return;
+        }
+        s.phase = Phase::Showing;
+    }
+    if let Some(r) = state(app).recording.lock().unwrap().take() {
+        std::thread::spawn(move || r.cancel());
+    }
+    if let Some(o) = get_overlay(app) {
+        show_overlay_focused(&o).await;
+    }
+    let _ = app.emit_to("overlay", "query-error", message);
 }
 
 // ─── Query pipeline ───────────────────────────────────────────────────────────
+
+/// Where a step points on screen: normalised 0–1 to the captured monitor,
+/// which is the monitor the overlay covers.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct StepTarget {
+    pub element_id: Option<u32>,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BeaconStep {
@@ -144,6 +381,8 @@ pub struct BeaconStep {
     pub instruction: String,
     pub keys: Option<String>,
     pub tip: Option<String>,
+    #[serde(default)]
+    pub target: Option<StepTarget>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -153,128 +392,222 @@ pub struct QueryResponse {
     pub summary: String,
     pub speech_b64: String,
     pub conversation_id: String,
-    // benchmark is not always present — make it optional so a missing field
-    // doesn't cause the whole deserialization to fail
-    #[serde(default)]
-    pub benchmark: Option<serde_json::Value>,
 }
 
-async fn run_query_pipeline(app: AppHandle, audio_data: Vec<u8>, screenshot_data_url: String) {
-    let state = app.state::<AppState>();
-    let client = state.http_client.clone();
-    let api_base = api_base();
-
-    // Convert dataUrl → raw PNG bytes → base64 string for the form field
-    let screenshot_b64 = if let Some(comma_pos) = screenshot_data_url.find(',') {
-        screenshot_data_url[comma_pos + 1..].to_string()
-    } else {
-        screenshot_data_url.clone()
-    };
-
-    // Build multipart/form-data.
-    // reqwest multipart bodies are streaming — they cannot be cloned or inspected
-    // as raw bytes after construction, so we must NOT pass them through
-    // fetch_with_auth (which tries to re-build the request from body bytes and
-    // silently drops streaming bodies). Instead we attach the auth header directly
-    // and call .send() here. A 401 mid-query is not expected (the token was just
-    // validated at capture time), so no retry logic is needed here.
-    let token = tokens::get(&app).map(|(a, _)| a);
-
-    let screenshot_part = reqwest::multipart::Part::text(screenshot_b64)
-        .mime_str("text/plain")
-        .unwrap();
-
-    let audio_part = reqwest::multipart::Part::bytes(audio_data)
-        .file_name("audio.webm")
-        .mime_str("audio/webm")
-        .unwrap();
-
-    let form = reqwest::multipart::Form::new()
-        .part("audio", audio_part)
-        .part("screenshot", screenshot_part);
-
-    let mut request = client
-        .post(format!("{api_base}/query"))
-        .multipart(form);
-
-    if let Some(tok) = token {
-        request = request.bearer_auth(tok);
+/// Pull a readable message out of a FastAPI error body.
+fn error_detail(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    match &v["detail"] {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(items) => items
+            .first()
+            .and_then(|i| i["msg"].as_str())
+            .map(str::to_string),
+        _ => None,
     }
+}
 
-    match request.send().await.map_err(|e| format!("network error: {e}")) {
-        Ok(resp) if resp.status().is_success() => {
+async fn run_query(app: AppHandle, id: u64, wav: Vec<u8>, shot: capture::MarkedScreenshot) {
+    let client = state(&app).http.clone();
+    let url = format!("{}/query", api_base());
+    let jpeg = shot.jpeg;
+    let context_json = serde_json::to_string(&shot.context).unwrap_or_default();
+    log::info!(
+        "[query] #{id} sending audio={}KB screenshot={}KB",
+        wav.len() / 1024,
+        jpeg.len() / 1024
+    );
+
+    let result = auth::send_authed(&app, &client, |token| {
+        let form = Form::new()
+            .part(
+                "audio",
+                Part::bytes(wav.clone())
+                    .file_name("audio.wav")
+                    .mime_str("audio/wav")
+                    .expect("static mime"),
+            )
+            .part(
+                "screenshot",
+                Part::bytes(jpeg.clone())
+                    .file_name("screen.jpg")
+                    .mime_str("image/jpeg")
+                    .expect("static mime"),
+            )
+            .text("context", context_json.clone());
+        client.post(&url).bearer_auth(token).multipart(form).timeout(QUERY_TIMEOUT)
+    })
+    .await;
+
+    let message = match result {
+        Ok(Authed::Response(resp)) if resp.status().is_success() => {
             match resp.json::<QueryResponse>().await {
-                Ok(query_resp) => {
-                    // Show overlay as interactive (non-focusable so target app keeps focus)
-                    if let Some(overlay) = get_overlay(&app) {
-                        let _ = overlay.set_ignore_cursor_events(false);
-                        let _ = overlay.show();
-                    }
-                    let _ = app.emit_to("overlay", "query-result", &query_resp);
+                Ok(q) => {
+                    dump_fixture(&jpeg, &context_json, &q);
+                    return deliver_result(&app, id, q).await;
                 }
                 Err(e) => {
-                    eprintln!("[query] parse error: {e}");
-                    show_overlay_for_error(&app);
-                    let _ = app.emit_to("overlay", "query-error", format!("Response parse error: {e}"));
+                    log::error!("[query] #{id} parse error: {e}");
+                    "The server sent a response I couldn't read — please try again.".to_string()
                 }
             }
         }
-        Ok(resp) => {
+        Ok(Authed::Response(resp)) => {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_else(|_| format!("HTTP {status}"));
-            eprintln!("[query] error {status}: {body}");
-            show_overlay_for_error(&app);
-            let _ = app.emit_to("overlay", "query-error", format!("Query failed: {body}"));
+            let body = resp.text().await.unwrap_or_default();
+            log::error!("[query] #{id} HTTP {status}: {body}");
+            error_detail(&body).unwrap_or_else(|| format!("Query failed (HTTP {status})."))
         }
-        Err(e) => {
-            eprintln!("[query] network error: {e}");
-            show_overlay_for_error(&app);
-            let _ = app.emit_to("overlay", "query-error", "Network error — check backend is running.".to_string());
+        Ok(Authed::Unauthorized) | Err(AuthError::Rejected) | Err(AuthError::NoSession) => {
+            log::warn!("[query] #{id} session no longer valid");
+            end_session(&app, false);
+            AuthError::Rejected.user_message()
         }
+        Err(e @ AuthError::Network(_)) => {
+            log::error!("[query] #{id} {e:?}");
+            e.user_message()
+        }
+    };
+    show_error(&app, id, message).await;
+}
+
+/// Dev aid for the grounding eval set (backend/eval/README.md): when
+/// `HOVERAI_FIXTURE_DIR` is set, save each query as a fixture case —
+/// screen.jpg (as sent, with marks), context.json, and case.json with the
+/// transcript; `expected` is left empty for a human to fill in.
+fn dump_fixture(jpeg: &[u8], context_json: &str, resp: &QueryResponse) {
+    let Some(root) = std::env::var_os("HOVERAI_FIXTURE_DIR") else { return };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let dir = std::path::Path::new(&root).join(format!("case-{stamp}"));
+    let case = serde_json::json!({
+        "request": resp.transcript,
+        "language": "",
+        "expected": [],
+        "observed": resp.steps,
+    });
+    let result = std::fs::create_dir_all(&dir)
+        .and_then(|_| std::fs::write(dir.join("screen.jpg"), jpeg))
+        .and_then(|_| std::fs::write(dir.join("context.json"), context_json))
+        .and_then(|_| {
+            std::fs::write(dir.join("case.json"), serde_json::to_vec_pretty(&case).unwrap_or_default())
+        });
+    match result {
+        Ok(()) => log::info!("[fixture] saved {}", dir.display()),
+        Err(e) => log::warn!("[fixture] could not save {}: {e}", dir.display()),
     }
 }
 
-fn show_overlay_for_error(app: &AppHandle) {
-    if let Some(overlay) = get_overlay(app) {
-        let _ = overlay.set_ignore_cursor_events(false);
-        let _ = overlay.show();
+async fn deliver_result(app: &AppHandle, id: u64, resp: QueryResponse) {
+    {
+        let mut s = state(app).session.lock().unwrap();
+        if s.id != id || s.phase != Phase::Thinking {
+            log::info!("[query] #{id} result dropped (session moved on)");
+            return;
+        }
+        s.phase = Phase::Showing;
+    }
+    log::info!("[query] #{id} {} steps", resp.steps.len());
+    if let Some(o) = get_overlay(app) {
+        show_overlay_focused(&o).await;
+    }
+    let _ = app.emit_to("overlay", "query-result", &resp);
+}
+
+// ─── Overlay hit regions ──────────────────────────────────────────────────────
+
+/// Rectangles that should take mouse input right now, or None when the
+/// overlay is idle (Rust manages click-through itself then). While thinking
+/// only the progress bar is drawn, so everything is click-through.
+pub(crate) fn interactive_regions(app: &AppHandle) -> Option<Vec<hit_region::Rect>> {
+    match phase(app) {
+        Phase::Idle => None,
+        Phase::Thinking => Some(Vec::new()),
+        Phase::Recording | Phase::Showing => Some(state(app).hit_regions.lock().unwrap().clone()),
     }
 }
 
 // ─── Tauri commands ───────────────────────────────────────────────────────────
 
+// ── Capture (from the overlay) ──
+
+/// The overlay reports its interactive widgets after every layout change.
+#[tauri::command]
+fn overlay_hit_regions(app: AppHandle, rects: Vec<hit_region::Rect>) {
+    *state(&app).hit_regions.lock().unwrap() = rects;
+    if let (Some(regions), Some(overlay)) = (interactive_regions(&app), get_overlay(&app)) {
+        hit_region::apply(&overlay, regions);
+    }
+}
+
+#[tauri::command]
+async fn capture_submit(app: AppHandle) {
+    submit_capture(app).await;
+}
+
+#[tauri::command]
+fn capture_cancel(app: AppHandle) {
+    cancel_capture(&app);
+}
+
+/// "Ask another question": hide the panel first so the new screenshot shows
+/// the user's screen, not HoverAI's own panel.
+#[tauri::command]
+async fn capture_again(app: AppHandle) {
+    if phase(&app) != Phase::Showing {
+        return;
+    }
+    cancel_capture(&app);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    start_capture(app).await;
+}
+
+// ── Microphone test (onboarding) ──
+
+#[tauri::command]
+async fn mic_monitor_start(app: AppHandle) -> Result<(), String> {
+    if phase(&app) != Phase::Idle {
+        return Err("busy".into());
+    }
+    if let Some(old) = state(&app).mic_monitor.lock().unwrap().take() {
+        old.cancel();
+    }
+    let a = app.clone();
+    let rec = tauri::async_runtime::spawn_blocking(move || audio::start(a, false))
+        .await
+        .map_err(|e| e.to_string())??;
+    *state(&app).mic_monitor.lock().unwrap() = Some(rec);
+    Ok(())
+}
+
+#[tauri::command]
+fn mic_monitor_stop(app: AppHandle) {
+    if let Some(rec) = state(&app).mic_monitor.lock().unwrap().take() {
+        std::thread::spawn(move || rec.cancel());
+    }
+}
+
 // ── Permissions ──
 
 #[tauri::command]
-async fn request_permission(id: String) -> String {
-    match id.as_str() {
-        "microphone" => {
-            #[cfg(target_os = "windows")]
-            {
-                // On Windows the browser API handles mic permission.
-                // Triggering getUserMedia from the renderer is sufficient.
-                "granted".to_string()
-            }
-            #[cfg(target_os = "macos")]
-            {
-                // macOS: trigger AVCaptureDevice access request
-                // The system dialog fires when the renderer calls getUserMedia.
-                "granted".to_string()
-            }
-            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            {
-                "granted".to_string()
-            }
-        }
-        "screen" => {
-            // Taking a screenshot triggers the macOS screen recording permission dialog.
-            match capture_screenshot_b64() {
-                Ok(_) => "granted".to_string(),
-                Err(_) => "denied".to_string(),
-            }
-        }
-        _ => "denied".to_string(),
-    }
+async fn request_permission(app: AppHandle, id: String) -> String {
+    let ok = match id.as_str() {
+        // Opening the device natively triggers the macOS prompt and fails if
+        // the OS has no usable input device.
+        "microphone" => tauri::async_runtime::spawn_blocking(move || audio::probe(app))
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false),
+        // Taking a screenshot triggers the macOS screen-recording prompt.
+        "screen" => tauri::async_runtime::spawn_blocking(|| capture::capture(None))
+            .await
+            .map(|r| r.is_ok_and(|shot| !shot.jpeg.is_empty()))
+            .unwrap_or(false),
+        _ => false,
+    };
+    if ok { "granted" } else { "denied" }.to_string()
 }
 
 // ── Token storage ──
@@ -284,9 +617,16 @@ fn store_tokens(app: AppHandle, access: String, refresh: String) {
     tokens::store(&app, &access, &refresh);
 }
 
+/// A usable access token for the renderer's API calls (refreshed if near expiry).
 #[tauri::command]
-fn get_access_token(app: AppHandle) -> Option<String> {
-    tokens::get(&app).map(|(a, _)| a)
+async fn get_access_token(app: AppHandle) -> Option<String> {
+    let client = state(&app).http.clone();
+    match auth::access_token(&app, &client).await {
+        Ok(t) => Some(t),
+        // Offline: hand back what we have and let the request decide.
+        Err(AuthError::Network(_)) => tokens::get(&app).map(|(a, _)| a),
+        Err(_) => None,
+    }
 }
 
 #[tauri::command]
@@ -294,34 +634,16 @@ fn clear_tokens(app: AppHandle) {
     tokens::clear(&app);
 }
 
+/// Called by the renderer after a 401. `stale` is the token that was rejected.
 #[tauri::command]
-async fn refresh_tokens(app: AppHandle) -> Option<String> {
-    let state = app.state::<AppState>();
-    let client = state.http_client.clone();
-    let api_base = api_base();
+async fn refresh_tokens(app: AppHandle, stale: Option<String>) -> Option<String> {
+    let client = state(&app).http.clone();
+    auth::refresh(&app, &client, stale.as_deref()).await.ok()
+}
 
-    let (_, refresh) = tokens::get(&app)?;
-
-    #[derive(Serialize)]
-    struct Body { refresh_token: String }
-
-    let resp = client
-        .post(format!("{api_base}/auth/refresh"))
-        .json(&Body { refresh_token: refresh })
-        .send()
-        .await
-        .ok()?;
-
-    if !resp.status().is_success() {
-        tokens::clear(&app);
-        return None;
-    }
-
-    #[derive(Deserialize)]
-    struct Resp { access_token: String, refresh_token: String }
-    let data: Resp = resp.json().await.ok()?;
-    tokens::store(&app, &data.access_token, &data.refresh_token);
-    Some(data.access_token)
+#[tauri::command]
+fn has_session(app: AppHandle) -> bool {
+    auth::has_session(&app)
 }
 
 // ── Settings ──
@@ -333,6 +655,10 @@ fn get_settings(app: AppHandle) -> settings::AppSettings {
 
 #[tauri::command]
 fn save_settings(app: AppHandle, s: settings::AppSettings) {
+    // The shortcut is owned by the register_* commands; a stale copy in the
+    // renderer must not overwrite it.
+    let mut s = s;
+    s.shortcut_key = settings::load(&app).shortcut_key;
     let wake_enabled = s.wake_word_enabled;
     settings::save(&app, &s);
     apply_wake_word_setting(&app, wake_enabled);
@@ -352,43 +678,48 @@ fn set_launch_at_login(app: AppHandle, enabled: bool) -> Result<bool, String> {
         mgr.disable().map_err(|e| e.to_string())
     };
 
+    // Whatever happened, persist what the OS actually has so the UI stays consistent.
+    let actual = mgr.is_enabled().unwrap_or(false);
+    let mut s = settings::load(&app);
+    s.launch_at_login = actual;
+    settings::save(&app, &s);
+
     match os_result {
         Ok(_) => {
-            // Confirm what the OS actually has registered now
-            let actual = mgr.is_enabled().unwrap_or(false);
-            let mut s = settings::load(&app);
-            s.launch_at_login = actual;
-            settings::save(&app, &s);
-            println!("[autostart] set enabled={enabled} → OS confirmed={actual}");
+            log::info!("[autostart] set enabled={enabled} → OS confirmed={actual}");
             Ok(actual)
         }
         Err(e) => {
-            eprintln!("[autostart] failed to set enabled={enabled}: {e}");
-            // Revert the setting to what the OS actually has so the UI stays consistent
-            let actual = mgr.is_enabled().unwrap_or(false);
-            let mut s = settings::load(&app);
-            s.launch_at_login = actual;
-            settings::save(&app, &s);
+            log::error!("[autostart] failed to set enabled={enabled}: {e}");
             Err(e)
         }
     }
 }
 
 /// Start the detector if `enabled` is true and it isn't running; stop it if false.
+#[cfg(feature = "wake-word")]
 fn apply_wake_word_setting(app: &AppHandle, enabled: bool) {
-    let state = app.state::<AppState>();
-    let mut guard = state.wake_word_stop.lock().unwrap();
+    let mut guard = state(app).wake_word_stop.lock().unwrap();
     if enabled {
         if guard.is_none() {
             let tx = wake_word::start(app.clone());
             *guard = Some(tx);
-            println!("[wake-word] started");
+            log::info!("[wake-word] started");
         }
-    } else {
+    } else if guard.take().is_some() {
         // Dropping the sender signals the detector thread to stop.
-        *guard = None;
-        println!("[wake-word] stopped");
+        log::info!("[wake-word] stopped");
     }
+}
+
+/// Built without the `wake-word` feature: the setting is persisted but ignored.
+#[cfg(not(feature = "wake-word"))]
+fn apply_wake_word_setting(_app: &AppHandle, _enabled: bool) {}
+
+/// Whether this build includes the wake-word detector (the UI hides it if not).
+#[tauri::command]
+fn wake_word_available() -> bool {
+    cfg!(feature = "wake-word")
 }
 
 /// IPC command so the renderer can toggle wake-word without a full settings save.
@@ -402,9 +733,7 @@ fn set_wake_word_enabled(app: AppHandle, enabled: bool) {
 
 #[tauri::command]
 fn get_active_shortcut(app: AppHandle) -> String {
-    let state = app.state::<AppState>();
-    let shortcut = state.active_shortcut.lock().unwrap().clone();
-    shortcut
+    state(&app).active_shortcut.lock().unwrap().clone()
 }
 
 // ── Shortcuts ──
@@ -421,6 +750,10 @@ fn test_shortcut(app: AppHandle, key: String) -> bool {
     if key.is_empty() || key.contains("Unidentified") {
         return false;
     }
+    // Testing the active shortcut must not unregister it.
+    if *state(&app).active_shortcut.lock().unwrap() == key {
+        return true;
+    }
     let tauri_key = electron_to_tauri_shortcut(&key);
     // Try to register; if it works, unregister and return true
     let mgr = app.global_shortcut();
@@ -433,133 +766,124 @@ fn test_shortcut(app: AppHandle, key: String) -> bool {
     }
 }
 
+/// Register `key` as the capture shortcut. The new shortcut is registered
+/// BEFORE the old one is released, so a failure leaves the old one working.
 fn do_register_shortcut(app: &AppHandle, key: &str) -> bool {
     let tauri_key = electron_to_tauri_shortcut(key);
-    let state = app.state::<AppState>();
+    let gs = app.global_shortcut();
+    let prev = state(app).active_shortcut.lock().unwrap().clone();
 
-    // Unregister previous
-    {
-        let prev = state.active_shortcut.lock().unwrap().clone();
-        if !prev.is_empty() {
-            let prev_tauri = electron_to_tauri_shortcut(&prev);
-            let _ = app.global_shortcut().unregister(prev_tauri.as_str());
-        }
+    if prev == key && gs.is_registered(tauri_key.as_str()) {
+        return true;
     }
 
     let app_clone = app.clone();
-    let result = app.global_shortcut().on_shortcut(
-        tauri_key.as_str(),
-        move |_app, _shortcut, event| {
-            if event.state() == ShortcutState::Pressed {
-                let app_inner = app_clone.clone();
-                tauri::async_runtime::spawn(async move {
-                    trigger_capture(app_inner).await;
-                });
-            }
-        },
-    );
+    let result = gs.on_shortcut(tauri_key.as_str(), move |_app, _shortcut, event| {
+        if event.state() == ShortcutState::Pressed {
+            let app_inner = app_clone.clone();
+            tauri::async_runtime::spawn(async move {
+                trigger_capture(app_inner).await;
+            });
+        }
+    });
 
     match result {
         Ok(_) => {
-            *state.active_shortcut.lock().unwrap() = key.to_string();
+            if !prev.is_empty() && prev != key {
+                let _ = gs.unregister(electron_to_tauri_shortcut(&prev).as_str());
+            }
+            *state(app).active_shortcut.lock().unwrap() = key.to_string();
+            log::info!("[shortcut] registered {key}");
             true
         }
         Err(e) => {
-            eprintln!("[shortcut] register failed: {e}");
+            log::error!("[shortcut] register {key} failed: {e}");
             false
         }
     }
 }
 
+/// True on Linux Wayland sessions, where global shortcuts go through the
+/// XDG portal (wayland_shortcut.rs) instead of tauri-plugin-global-shortcut.
+fn is_wayland() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        wayland_shortcut::is_wayland()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Bind `key` through the platform's extra mechanism (Wayland portal).
+fn bind_platform_shortcut(app: &AppHandle, key: &str) {
+    #[cfg(target_os = "linux")]
+    wayland_shortcut::bind(app.clone(), key);
+    #[cfg(not(target_os = "linux"))]
+    let _ = (app, key);
+}
+
+fn unbind_platform_shortcut() {
+    #[cfg(target_os = "linux")]
+    wayland_shortcut::unbind();
+}
+
+fn unregister_active_shortcut(app: &AppHandle) {
+    let prev = std::mem::take(&mut *state(app).active_shortcut.lock().unwrap());
+    if !prev.is_empty() {
+        let _ = app
+            .global_shortcut()
+            .unregister(electron_to_tauri_shortcut(&prev).as_str());
+    }
+}
+
 #[tauri::command]
 fn register_shortcut(app: AppHandle, key: String) -> bool {
-    let ok = do_register_shortcut(&app, &key);
+    // On Wayland the X11 grab (via XWayland) may fail or never fire; the
+    // portal binding below is what actually delivers the shortcut there.
+    let ok = do_register_shortcut(&app, &key) || is_wayland();
     if ok {
         let mut s = settings::load(&app);
         s.shortcut_key = key.clone();
         settings::save(&app, &s);
+        bind_platform_shortcut(&app, &key);
     }
     ok
+}
+
+#[derive(Serialize)]
+struct PlatformInfo {
+    os: &'static str,
+    wayland: bool,
+}
+
+/// Lets the UI explain platform-specific shortcut behaviour.
+#[tauri::command]
+fn platform_info() -> PlatformInfo {
+    PlatformInfo { os: std::env::consts::OS, wayland: is_wayland() }
 }
 
 #[tauri::command]
 fn register_shortcut_from_settings(app: AppHandle, key: String) -> bool {
-    let ok = do_register_shortcut(&app, &key);
-    if ok {
-        let mut s = settings::load(&app);
-        s.shortcut_key = key.clone();
-        settings::save(&app, &s);
-    }
-    ok
+    register_shortcut(app, key)
 }
 
 // ── Overlay lifecycle ──
 
-#[tauri::command]
-async fn focus_overlay(app: AppHandle) {
-    if let Some(overlay) = get_overlay(&app) {
-        let _ = overlay.set_ignore_cursor_events(false);
-        let _ = overlay.show();
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        let _ = overlay.set_focus();
-    }
-}
-
+/// Kept for the renderer's `dismissOverlay()`; same as cancel.
 #[tauri::command]
 fn dismiss_overlay(app: AppHandle) {
-    if let Some(overlay) = get_overlay(&app) {
-        let _ = overlay.hide();
-        let _ = overlay.set_ignore_cursor_events(true);
-        let _ = app.emit_to("overlay", "capture-end", ());
-    }
+    cancel_capture(&app);
 }
 
+/// Called after onboarding completes — make sure the hidden overlay is click-through.
 #[tauri::command]
-fn move_overlay(app: AppHandle, x: i32, y: i32) {
-    if let Some(overlay) = get_overlay(&app) {
-        let _ = overlay.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }));
-    }
+fn launch_overlay(app: AppHandle) {
+    hide_overlay(&app);
 }
 
-// ── Capture done (audio from renderer → start query pipeline) ──
-
-#[tauri::command]
-async fn capture_done(app: AppHandle, audio_data: Vec<u8>) {
-    // Hide/blur overlay so query pipeline runs while target app has focus
-    if let Some(overlay) = get_overlay(&app) {
-        let _ = overlay.set_ignore_cursor_events(true);
-    }
-    let state = app.state::<AppState>();
-    let screenshot = state.last_screenshot.lock().unwrap().clone();
-    let app_clone = app.clone();
-    tauri::async_runtime::spawn(async move {
-        run_query_pipeline(app_clone, audio_data, screenshot).await;
-    });
-}
-
-#[tauri::command]
-async fn capture_done_with_screenshot(
-    app: AppHandle,
-    audio_data: Vec<u8>,
-    screenshot_data_url: String,
-) {
-    if let Some(overlay) = get_overlay(&app) {
-        let _ = overlay.set_ignore_cursor_events(true);
-    }
-    let app_clone = app.clone();
-    tauri::async_runtime::spawn(async move {
-        run_query_pipeline(app_clone, audio_data, screenshot_data_url).await;
-    });
-}
-
-// ── Screenshot ──
-
-#[tauri::command]
-fn take_screenshot() -> Result<String, String> {
-    capture_screenshot_b64()
-}
-
-// ── Settings window ──
+// ── Windows ──
 
 #[tauri::command]
 fn open_settings_window(app: AppHandle) {
@@ -576,63 +900,123 @@ fn close_settings_window(app: AppHandle) {
     }
 }
 
-// ── Sign out ──
-
-#[tauri::command]
-async fn sign_out(app: AppHandle) {
-    let state = app.state::<AppState>();
-    let client = state.http_client.clone();
-    let api_base = api_base();
-
-    // Fire-and-forget: revoke refresh token
-    if let Some((_, refresh)) = tokens::get(&app) {
-        #[derive(Serialize)]
-        struct Body { refresh_token: String }
-        let _ = client
-            .post(format!("{api_base}/auth/signout"))
-            .json(&Body { refresh_token: refresh })
-            .send()
-            .await;
-    }
-
-    tokens::clear(&app);
-
-    // Unregister shortcut
-    {
-        let prev = state.active_shortcut.lock().unwrap().clone();
-        if !prev.is_empty() {
-            let prev_tauri = electron_to_tauri_shortcut(&prev);
-            let _ = app.global_shortcut().unregister(prev_tauri.as_str());
-            *state.active_shortcut.lock().unwrap() = String::new();
-        }
-    }
-
-    // Close settings window
-    close_settings_window(app.clone());
-
-    // Show main onboarding window
-    if let Some(main_win) = app.get_webview_window("main") {
-        let _ = main_win.show();
-        let _ = main_win.set_focus();
+fn show_main_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
     }
 }
 
-// ── launch-overlay (called after onboarding completes) ──
+/// Onboarded = signed in AND a shortcut was chosen. Only then does closing
+/// the main window keep the app running in the tray.
+fn is_onboarded(app: &AppHandle) -> bool {
+    auth::has_session(app) && !settings::load(app).shortcut_key.is_empty()
+}
+
+// ── Sign out / session end ──
+
+/// Tear down the signed-in state and return to the sign-in screen.
+/// `revoke` also revokes the refresh token server-side (explicit sign-out).
+fn end_session(app: &AppHandle, revoke: bool) {
+    let refresh = tokens::get(app).map(|(_, r)| r);
+    tokens::clear(app);
+    cancel_capture(app);
+    unregister_active_shortcut(app);
+    unbind_platform_shortcut();
+    apply_wake_word_setting(app, false);
+    close_settings_window(app.clone());
+    let _ = app.emit_to("main", "signed-out", ());
+    show_main_window(app);
+
+    if let (true, Some(refresh)) = (revoke, refresh) {
+        let client = state(app).http.clone();
+        tauri::async_runtime::spawn(async move {
+            #[derive(Serialize)]
+            struct Body {
+                refresh_token: String,
+            }
+            let _ = client
+                .post(format!("{}/auth/signout", api_base()))
+                .json(&Body { refresh_token: refresh })
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await;
+        });
+    }
+}
 
 #[tauri::command]
-fn launch_overlay(app: AppHandle) {
-    // Pre-warm the overlay window
-    if let Some(overlay) = get_overlay(&app) {
-        // Already created by config, just ensure it's ready
-        let _ = overlay.set_ignore_cursor_events(true);
+fn sign_out(app: AppHandle) {
+    log::info!("[auth] sign out");
+    end_session(&app, true);
+}
+
+// ── Quit ──
+
+/// Release everything and exit. A watchdog force-exits if teardown hangs, so
+/// the process never lingers in the background after "Quit".
+fn quit(app: &AppHandle) {
+    log::info!("[app] quit requested");
+    cancel_capture(app);
+    if let Some(m) = state(app).mic_monitor.lock().unwrap().take() {
+        std::thread::spawn(move || m.cancel());
     }
+    apply_wake_word_setting(app, false);
+    unbind_platform_shortcut();
+    let _ = app.global_shortcut().unregister_all();
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(2));
+        log::warn!("[app] graceful exit timed out — forcing exit");
+        std::process::exit(0);
+    });
+    app.exit(0);
+}
+
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    quit(&app);
 }
 
 // ─── App entry point ──────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
+
+    let http = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+
     tauri::Builder::default()
+        // Must be the first plugin: a second launch forwards its args here and exits.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if args.iter().any(|a| a == "--trigger") {
+                if is_onboarded(app) {
+                    let h = app.clone();
+                    tauri::async_runtime::spawn(async move { trigger_capture(h).await });
+                } else {
+                    show_main_window(app);
+                }
+            } else if is_onboarded(app) {
+                open_settings_window(app.clone());
+            } else {
+                show_main_window(app);
+            }
+        }))
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .targets([
+                    Target::new(TargetKind::Stdout),
+                    Target::new(TargetKind::LogDir { file_name: Some("hoverai".into()) }),
+                ])
+                .max_file_size(2_000_000)
+                .rotation_strategy(RotationStrategy::KeepOne)
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -643,47 +1027,62 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             active_shortcut: Mutex::new(String::new()),
-            last_screenshot: Mutex::new(String::new()),
-            http_client: Client::new(),
+            http,
+            session: Mutex::new(Session { id: 0, phase: Phase::Idle }),
+            recording: Mutex::new(None),
+            screenshot: Mutex::new(None),
+            mic_monitor: Mutex::new(None),
+            hit_regions: Mutex::new(Vec::new()),
+            #[cfg(feature = "wake-word")]
             wake_word_stop: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             // Permissions
             request_permission,
+            mic_monitor_start,
+            mic_monitor_stop,
             // Tokens
             store_tokens,
             get_access_token,
             clear_tokens,
             refresh_tokens,
+            has_session,
             // Settings
             get_settings,
             save_settings,
             get_active_shortcut,
             set_wake_word_enabled,
+            wake_word_available,
             set_launch_at_login,
             // Shortcuts
             test_shortcut,
             register_shortcut,
             register_shortcut_from_settings,
-            // Overlay
-            focus_overlay,
+            platform_info,
+            // Overlay / capture
+            capture_submit,
+            capture_cancel,
+            capture_again,
+            overlay_hit_regions,
             dismiss_overlay,
-            move_overlay,
             launch_overlay,
-            // Capture
-            capture_done,
-            capture_done_with_screenshot,
-            take_screenshot,
             // Windows
             open_settings_window,
             close_settings_window,
             sign_out,
+            quit_app,
         ])
         .setup(|app| {
+            log::info!(
+                "[app] HoverAI {} starting — API {}",
+                app.package_info().version,
+                api_base()
+            );
             setup_tray(app)?;
-            restore_shortcut_on_startup(app);
+            hit_region::start_poller(app.handle().clone());
+            startup(app.handle().clone());
 
-            let saved = settings::load(&app.handle());
+            let saved = settings::load(app.handle());
 
             // Sync autostart entry with the persisted setting so the OS state
             // always matches what the toggle says, even after a reinstall.
@@ -699,7 +1098,7 @@ pub fn run() {
 
             // Start wake-word detector off the main thread — cpal + ONNX Runtime
             // load native DLLs that must not block or crash the Tauri event loop.
-            if saved.wake_word_enabled {
+            if cfg!(feature = "wake-word") && saved.wake_word_enabled {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn_blocking(move || {
                     apply_wake_word_setting(&handle, true);
@@ -708,11 +1107,17 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Prevent app from quitting when all windows close — tray keeps it alive
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // Only hide, don't destroy
-                let _ = window.hide();
                 api.prevent_close();
+                let app = window.app_handle();
+                match window.label() {
+                    // Before onboarding is finished, closing the window means "quit".
+                    "main" if !is_onboarded(app) => quit(app),
+                    "overlay" => cancel_capture(app),
+                    _ => {
+                        let _ = window.hide();
+                    }
+                }
             }
         })
         .run(tauri::generate_context!())
@@ -723,7 +1128,7 @@ pub fn run() {
 
 fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let settings_item = MenuItemBuilder::with_id("settings", "Settings").build(app)?;
-    let quit_item = MenuItemBuilder::with_id("quit", "Stop HoverAI").build(app)?;
+    let quit_item = MenuItemBuilder::with_id("quit", "Quit HoverAI").build(app)?;
     let menu = MenuBuilder::new(app)
         .item(&settings_item)
         .separator()
@@ -733,7 +1138,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // Load the 32×32 icon and force-convert to RGBA so Tauri's tray accepts it
     let icon = {
         let img_bytes = include_bytes!("../icons/32x32.png");
-        let img = screenshots::image::load_from_memory(img_bytes)
+        let img = xcap::image::load_from_memory(img_bytes)
             .map_err(|e| format!("tray icon load error: {e}"))?
             .into_rgba8();
         let w = img.width();
@@ -746,14 +1151,24 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .menu(&menu)
         .tooltip("HoverAI")
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "settings" => open_settings_window(app.clone()),
-            "quit" => app.exit(0),
+            "settings" => {
+                if is_onboarded(app) {
+                    open_settings_window(app.clone())
+                } else {
+                    show_main_window(app)
+                }
+            }
+            "quit" => quit(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click { .. } = event {
                 let app = tray.app_handle();
-                open_settings_window(app.clone());
+                if is_onboarded(app) {
+                    open_settings_window(app.clone());
+                } else {
+                    show_main_window(app);
+                }
             }
         })
         .build(app)?;
@@ -761,82 +1176,41 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// ─── Startup: restore saved shortcut + validate token ─────────────────────────
+// ─── Startup: decide onboarding locally, validate the session in background ──
 
-fn restore_shortcut_on_startup(app: &mut tauri::App) {
-    let app_handle = app.handle().clone();
+fn startup(app: AppHandle) {
+    // Decide from local state immediately — no network wait before the UI.
+    if !is_onboarded(&app) {
+        show_main_window(&app);
+        return;
+    }
+    let shortcut = settings::load(&app).shortcut_key;
+    if !do_register_shortcut(&app, &shortcut) && !is_wayland() {
+        log::error!("[shortcut] could not restore {shortcut} — already taken?");
+        // Let the user pick another one in Settings.
+        open_settings_window(app.clone());
+    }
+    bind_platform_shortcut(&app, &shortcut);
+    hide_overlay(&app);
+
+    // Validate the session in the background; only an explicit rejection
+    // signs the user out. Being offline keeps them signed in.
     tauri::async_runtime::spawn(async move {
-        // Validate token against server
-        let should_skip_onboarding = validate_token_on_startup(&app_handle).await;
-
-        if should_skip_onboarding {
-            // Restore saved shortcut
-            let saved = settings::load(&app_handle);
-            if !saved.shortcut_key.is_empty() {
-                let ok = do_register_shortcut(&app_handle, &saved.shortcut_key);
-                if ok {
-                    println!("[shortcut] restored on startup: {}", saved.shortcut_key);
-                } else {
-                    eprintln!("[shortcut] could not restore {} — already taken", saved.shortcut_key);
-                }
+        let client = state(&app).http.clone();
+        let url = format!("{}/users/me", api_base());
+        let result = auth::send_authed(&app, &client, |token| {
+            client.get(&url).bearer_auth(token).timeout(STARTUP_PROBE_TIMEOUT)
+        })
+        .await;
+        match result {
+            Ok(Authed::Response(r)) => log::info!("[auth] startup check: HTTP {}", r.status()),
+            Ok(Authed::Unauthorized) | Err(AuthError::Rejected) | Err(AuthError::NoSession) => {
+                log::warn!("[auth] stored session rejected — returning to sign-in");
+                end_session(&app, false);
             }
-            // Hide main window (onboarding), pre-warm overlay
-            if let Some(main_win) = app_handle.get_webview_window("main") {
-                let _ = main_win.hide();
-            }
-            if let Some(overlay) = get_overlay(&app_handle) {
-                let _ = overlay.set_ignore_cursor_events(true);
+            Err(AuthError::Network(e)) => {
+                log::warn!("[auth] startup check offline ({e}) — keeping session");
             }
         }
-        // If token invalid, main window stays visible (onboarding shows)
     });
-}
-
-async fn validate_token_on_startup(app: &AppHandle) -> bool {
-    let tokens_opt = tokens::get(app);
-    let (access, _) = match tokens_opt {
-        Some(t) => t,
-        None => return false,
-    };
-
-    // Check local expiry first
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-
-    if tokens::jwt_expiry(&access) <= now + 60 {
-        tokens::clear(app);
-        return false;
-    }
-
-    // Probe server
-    let state = app.state::<AppState>();
-    let client = state.http_client.clone();
-    let api_base = api_base();
-
-    let request = client
-        .get(format!("{api_base}/users/me"))
-        .header("Authorization", format!("Bearer {access}"));
-
-    match http_client::fetch_with_auth(app, &client, request).await {
-        Ok(resp) if resp.status().is_success() => {
-            println!("[auth] server confirmed valid token — skipping onboarding");
-            true
-        }
-        Ok(resp) => {
-            // Server explicitly rejected the token (401/403/etc.) — clear it
-            println!("[auth] server rejected token ({}) — clearing", resp.status());
-            tokens::clear(app);
-            false
-        }
-        Err(e) => {
-            // Network unreachable (backend down, no internet, ngrok offline).
-            // Do NOT clear the token — the JWT is still locally valid.
-            // Trust it and skip onboarding; the first real API call will surface
-            // the error to the user with a proper error message.
-            eprintln!("[auth] could not reach server: {e} — trusting local token");
-            true
-        }
-    }
 }

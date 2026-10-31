@@ -36,11 +36,13 @@ export default function PermissionsPage({ onComplete }: PermissionsPageProps) {
     screen: 'idle',
   })
   const [wakeWordEnabled, setWakeWordEnabled] = useState(false)
+  const [wakeWordAvailable, setWakeWordAvailable] = useState(false)
 
   useEffect(() => {
     window.api.getSettings().then((s) => {
       setWakeWordEnabled(s.wakeWordEnabled)
     }).catch(() => {})
+    window.api.wakeWordAvailable().then(setWakeWordAvailable).catch(() => {})
   }, [])
 
   const allGranted = PERMISSIONS.every((p) => statuses[p.id] === 'granted')
@@ -63,29 +65,8 @@ export default function PermissionsPage({ onComplete }: PermissionsPageProps) {
     if (current === 'requesting') return
     setStatuses((prev) => ({ ...prev, [id]: 'requesting' }))
     try {
-      if (id === 'microphone') {
-        try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-          stream.getTracks().forEach((t) => t.stop())
-        } catch {
-          setStatuses((prev) => ({ ...prev, [id]: 'denied' }))
-          return
-        }
-        try {
-          const perm = await navigator.permissions.query({ name: 'microphone' as PermissionName })
-          const result = perm.state === 'granted' ? 'granted' : 'denied'
-          setStatuses((prev) => ({ ...prev, [id]: result }))
-          perm.onchange = () => {
-            setStatuses((prev) => ({
-              ...prev,
-              [id]: perm.state === 'granted' ? 'granted' : 'idle',
-            }))
-          }
-          return
-        } catch {
-          // fall through to IPC
-        }
-      }
+      // Both checks run natively in Rust: it opens the microphone (cpal) and
+      // takes a test screenshot, which also triggers the macOS prompts.
       const result = await window.api.requestPermission(id)
       setStatuses((prev) => ({ ...prev, [id]: result }))
     } catch {
@@ -276,7 +257,8 @@ export default function PermissionsPage({ onComplete }: PermissionsPageProps) {
           )
         })}
 
-        {/* ── Wake word card — optional ── */}
+        {/* ── Wake word card — optional, only in builds with the wake-word feature ── */}
+        {wakeWordAvailable && (
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0, transition: { duration: 0.4, delay: 0.26, ease: [0.22, 1, 0.36, 1] as const } }}
@@ -341,6 +323,7 @@ export default function PermissionsPage({ onComplete }: PermissionsPageProps) {
             />
           </button>
         </motion.div>
+        )}
       </div>
 
       {/* ── CTA — pinned at bottom, never scrolls ── */}

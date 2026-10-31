@@ -69,7 +69,7 @@ pub fn store(app: &tauri::AppHandle, access: &str, refresh: &str) {
 
     let ok = access_entry
         .and_then(|e| e.set_password(access))
-        .and_then(|_| refresh_entry)
+        .and(refresh_entry)
         .and_then(|e| e.set_password(refresh))
         .is_ok();
 

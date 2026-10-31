@@ -1,5 +1,5 @@
 // ─── Settings storage ─────────────────────────────────────────────────────────
-// AppSettings persisted to app_data_dir/settings.json via tauri-plugin-store.
+// AppSettings persisted as JSON at app_data_dir/settings.json (plain fs).
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -9,27 +9,25 @@ use tauri::Manager;
 /// Overlay size — mirrors backend `Literal["compact", "default", "large"]`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum OverlaySize {
     Compact,
+    #[default]
     Default,
     Large,
 }
 
-impl Default for OverlaySize {
-    fn default() -> Self { OverlaySize::Default }
-}
 
 /// AI voice gender — mirrors backend `Literal["female", "male"]`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum VoiceGender {
+    #[default]
     Female,
     Male,
 }
 
-impl Default for VoiceGender {
-    fn default() -> Self { VoiceGender::Female }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
