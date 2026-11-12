@@ -1,6 +1,6 @@
 [package]
 name = "hoverai-desktop"
-version = "0.1.0"
+version = "0.1.2"
 description = "HoverAI — AI-powered on-screen assistant"
 authors = ["HoverAI"]
 edition = "2021"
