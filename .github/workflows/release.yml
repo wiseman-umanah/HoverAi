@@ -16,21 +16,20 @@ jobs:
           # ── Windows ──────────────────────────────────────────────────────────
           - platform: windows-latest
             target:   x86_64-pc-windows-msvc
+            rust_targets: x86_64-pc-windows-msvc
             label:    windows
 
-          # ── macOS Apple Silicon ───────────────────────────────────────────────
-          - platform: macos-latest   # GitHub's macos-latest is now Apple Silicon (M1)
-            target:   aarch64-apple-darwin
-            label:    mac-arm
-
-          # ── macOS Intel ───────────────────────────────────────────────────────
-          - platform: macos-13       # macos-13 is the last Intel runner
-            target:   x86_64-apple-darwin
-            label:    mac-intel
+          # ── macOS universal (Apple Silicon + Intel in one .app) ─────────────
+          # Built on the arm runner; the Intel `macos-13` runner is retired.
+          - platform: macos-latest
+            target:   universal-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            label:    mac-universal
 
           # ── Linux ─────────────────────────────────────────────────────────────
           - platform: ubuntu-22.04
             target:   x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
             label:    linux
 
     runs-on: ${{ matrix.platform }}
@@ -40,28 +39,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 2. Node + pnpm ───────────────────────────────────────────────────────
+      # ── 2. pnpm + Node (pnpm first so setup-node can cache the store) ────────
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: 9
+          cache: pnpm
+          cache-dependency-path: hoverai-desktop/pnpm-lock.yaml
 
       # ── 3. Rust toolchain + target ───────────────────────────────────────────
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.rust_targets }}
 
       # Rust build cache — dramatically cuts rebuild time on subsequent runs
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: hoverai-desktop/src-tauri
+          key: release-${{ matrix.target }}
 
       # ── 4. Linux system dependencies (WebKit2GTK + audio/screen libs) ────────
       - name: Install Linux deps
@@ -83,14 +85,24 @@ jobs:
             libxcb1-dev \
             libgbm-dev \
             libegl1-mesa-dev \
-            pkg-config
+            pkg-config \
+            patchelf \
+            libfuse2
 
       # ── 5. Write .env (API base URL comes from a repository secret) ───────────
       # Set VITE_API_BASE in: repo Settings → Secrets and variables → Actions
       - name: Write .env
         working-directory: hoverai-desktop
         shell: bash
-        run: echo "VITE_API_BASE=${{ secrets.VITE_API_BASE }}" > .env
+        env:
+          VITE_API_BASE: ${{ secrets.VITE_API_BASE }}
+        run: |
+          # A release pointing at localhost is useless — fail loudly instead.
+          if [ -z "$VITE_API_BASE" ]; then
+            echo "::error::Repository secret VITE_API_BASE is not set"
+            exit 1
+          fi
+          echo "VITE_API_BASE=$VITE_API_BASE" > .env
 
       # ── 6. Install JS deps ───────────────────────────────────────────────────
       - name: Install JS deps
@@ -114,14 +126,17 @@ jobs:
           # APPLE_ID:                     ${{ secrets.APPLE_ID }}
           # APPLE_PASSWORD:               ${{ secrets.APPLE_PASSWORD }}
           # APPLE_TEAM_ID:                ${{ secrets.APPLE_TEAM_ID }}
-          # Windows code signing (optional)
-          # TAURI_SIGNING_PRIVATE_KEY:    ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Auto-update signing (required): bundle.createUpdaterArtifacts is on, so
+          # the build fails without the private key. Its public half is in
+          # tauri.conf.json → plugins.updater.pubkey.
+          TAURI_SIGNING_PRIVATE_KEY:          ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: hoverai-desktop
           tagName:     ${{ github.ref_name }}
           releaseName: 'HoverAI ${{ github.ref_name }}'
           releaseBody: 'See CHANGELOG for details.'
-          releaseDraft: true          # creates a draft — you publish manually after review
+          releaseDraft: true          # a draft — installed apps only see it (latest.json) once you publish it
           prerelease:   false
+          includeUpdaterJson: true    # uploads latest.json for the updater endpoint
           args:         --target ${{ matrix.target }}

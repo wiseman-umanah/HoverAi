@@ -1,0 +1,114 @@
+name: Package
+
+# Installable desktop builds for every PR that touches the app, uploaded as
+# workflow artifacts (Actions run page → "Artifacts") for testing in a VM or
+# on a tester's machine. Uses the `release-fast` Cargo profile (no LTO) so a
+# run takes minutes, not the ~45 min of the full release profile; tagged
+# releases (release.yml) still use the full `release` profile.
+#
+# The API base URL comes from the VITE_API_BASE repository secret. Secrets
+# are not passed to PRs from forks — those builds fall back to localhost.
+
+on:
+  pull_request:
+    paths:
+      - 'hoverai-desktop/**'
+      - '.github/workflows/package.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            target:   x86_64-pc-windows-msvc
+            rust_targets: x86_64-pc-windows-msvc
+            bundles:  nsis,msi
+            label:    windows
+          # One universal (Apple Silicon + Intel) build on the arm runner.
+          - platform: macos-latest
+            target:   universal-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            bundles:  app,dmg
+            label:    macos-universal
+          - platform: ubuntu-22.04
+            target:   x86_64-unknown-linux-gnu
+            rust_targets: x86_64-unknown-linux-gnu
+            bundles:  appimage,deb
+            label:    linux
+
+    name: Package (${{ matrix.label }})
+    runs-on: ${{ matrix.platform }}
+    defaults:
+      run:
+        working-directory: hoverai-desktop
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux deps (WebKitGTK, tray, ALSA, keyring, xcap/PipeWire, AppImage)
+        if: runner.os == 'Linux'
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev libglib2.0-dev libasound2-dev libsecret-1-dev \
+            libpipewire-0.3-dev libclang-dev libwayland-dev libxcb1-dev \
+            libgbm-dev libegl1-mesa-dev pkg-config patchelf libfuse2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: hoverai-desktop/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hoverai-desktop/src-tauri
+          key: package-${{ matrix.target }}
+
+      - name: Write .env
+        env:
+          VITE_API_BASE: ${{ secrets.VITE_API_BASE }}
+        run: |
+          if [ -z "$VITE_API_BASE" ]; then
+            echo "::warning::VITE_API_BASE secret not available — this build talks to http://localhost:8000"
+          fi
+          echo "VITE_API_BASE=$VITE_API_BASE" > .env
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+
+      - name: Build installers
+        # Update artifacts need the signing key (not given to fork PRs) and are
+        # only used by releases, so PR builds switch them off.
+        run: >-
+          pnpm tauri build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          -- --profile release-fast
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hoverai-${{ matrix.label }}-${{ github.sha }}
+          path: |
+            hoverai-desktop/src-tauri/target/${{ matrix.target }}/release-fast/bundle/nsis/*.exe
+            hoverai-desktop/src-tauri/target/${{ matrix.target }}/release-fast/bundle/msi/*.msi
+            hoverai-desktop/src-tauri/target/${{ matrix.target }}/release-fast/bundle/dmg/*.dmg
+            hoverai-desktop/src-tauri/target/${{ matrix.target }}/release-fast/bundle/appimage/*.AppImage
+            hoverai-desktop/src-tauri/target/${{ matrix.target }}/release-fast/bundle/deb/*.deb
+          if-no-files-found: error
+          retention-days: 14
