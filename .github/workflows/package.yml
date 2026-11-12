@@ -37,7 +37,7 @@ jobs:
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
             bundles:  app,dmg
             label:    macos-universal
-          - platform: ubuntu-22.04
+          - platform: ubuntu-24.04
             target:   x86_64-unknown-linux-gnu
             rust_targets: x86_64-unknown-linux-gnu
             bundles:  appimage,deb
@@ -62,7 +62,7 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev libssl-dev libglib2.0-dev libasound2-dev libsecret-1-dev \
             libpipewire-0.3-dev libclang-dev libwayland-dev libxcb1-dev \
-            libgbm-dev libegl1-mesa-dev pkg-config patchelf libfuse2
+            libgbm-dev libegl1-mesa-dev pkg-config patchelf libfuse2t64
 
       - uses: pnpm/action-setup@v4
         with:
@@ -96,9 +96,11 @@ jobs:
       - name: Build installers
         # Update artifacts need the signing key (not given to fork PRs) and are
         # only used by releases, so PR builds switch them off.
+        # `devtools`: right-click → Inspect works in these test builds.
         run: >-
           pnpm tauri build --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
           --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          --features devtools
           -- --profile release-fast
 
       - uses: actions/upload-artifact@v4
