@@ -1,6 +1,6 @@
 # HoverAI Desktop
 
-AI-powered on-screen assistant. Activate with a keyboard shortcut or the **"Hey Hover"** wake word, speak or type your request, and get step-by-step visual guidance overlaid directly on your screen.
+AI-powered on-screen assistant. Activate with a keyboard shortcut, speak or type your request, and get step-by-step visual guidance overlaid directly on your screen.
 
 Built with **Tauri 2**, **React 19**, **TypeScript 6**, and **Rust**.
 
@@ -25,15 +25,14 @@ Built with **Tauri 2**, **React 19**, **TypeScript 6**, and **Rust**.
 
 | Feature | Detail |
 |---|---|
-| **Wake-word detection** | Always-on "Hey Hover" detector running in Rust via `livekit-wakeword` + ONNX Runtime. Configurable sensitivity (1–10). 1.5 s cooldown. |
 | **Transparent overlay** | Frameless, always-on-top window that captures audio + screenshot and streams AI guidance back. |
-| **Global shortcut** | User-defined keyboard combo registered via `tauri-plugin-global-shortcut`. Works as reliable fallback when wake-word is inactive. |
-| **Guided onboarding** | Auth → Permissions (mic + screen, optional wake-word toggle) → Shortcut setup. Enter key advances each step. |
+| **Global shortcut** | User-defined keyboard combo registered via `tauri-plugin-global-shortcut`. |
+| **Guided onboarding** | Auth → Permissions (mic + screen) → Shortcut setup. Enter key advances each step. |
 | **Settings sync** | Local `settings.json` + server `/users/me/settings`. Settings page loads instantly from local data; server data merges in silently. |
 | **Secure token storage** | JWTs stored in the OS credential store (Windows Credential Manager / macOS Keychain / Linux Secret Service) via the `keyring` crate, with a plain-JSON fallback. |
 | **Launch at startup** | Powered by `tauri-plugin-autostart`. Toggle in Settings → System. OS state is confirmed and snapped back if the write fails. |
 | **Conversation history** | History tab in Settings fetches and renders previous sessions from the backend. |
-| **Multi-platform** | Windows (NSIS), macOS (DMG — Apple Silicon + Intel), Linux (AppImage + deb). |
+| **Multi-platform** | Windows (NSIS + MSI), macOS (universal DMG — Apple Silicon + Intel), Linux (AppImage + deb). |
 
 ---
 
@@ -55,7 +54,6 @@ Built with **Tauri 2**, **React 19**, **TypeScript 6**, and **Rust**.
 │  Rust backend  (src-tauri/src/)                         │
 │                                                         │
 │  lib.rs        ─── 40+ IPC commands, tray, shortcuts   │
-│  wake_word.rs  ─── cpal mic capture → ONNX inference   │
 │  tokens.rs     ─── OS keyring + JWT decode              │
 │  settings.rs   ─── settings.json read/write             │
 │  http_client.rs─── fetchWithAuth + token refresh        │
@@ -136,7 +134,7 @@ hoverai-desktop/
 │   ├── settings.tsx          # Settings entry point
 │   ├── pages/
 │   │   ├── AuthPage.tsx      # Sign in / sign up
-│   │   ├── PermissionsPage.tsx  # Mic + screen grants, optional wake-word toggle
+│   │   ├── PermissionsPage.tsx  # Mic + screen grants
 │   │   ├── ShortcutPage.tsx  # Keyboard shortcut recorder
 │   │   └── SettingsPage.tsx  # Full settings + conversation history
 │   ├── lib/
@@ -152,11 +150,8 @@ hoverai-desktop/
     ├── build.rs              # Reads .env → cargo:rustc-env
     ├── capabilities/
     │   └── default.json      # Tauri capability permissions
-    ├── resources/
-    │   └── hey_hover.onnx    # Wake-word classifier (bundled into app)
     └── src/
         ├── lib.rs            # Main backend — all IPC commands, tray, shortcuts
-        ├── wake_word.rs      # cpal mic capture + ONNX wake-word pipeline
         ├── tokens.rs         # OS keyring token storage
         ├── settings.rs       # settings.json persistence
         └── http_client.rs    # fetchWithAuth + automatic token refresh
@@ -171,7 +166,6 @@ All renderer → Rust communication goes through `window.api` (defined in [`taur
 | Command | Direction | Purpose |
 |---|---|---|
 | `get_settings` / `save_settings` | invoke | Read / write `settings.json` |
-| `set_wake_word_enabled` | invoke | Toggle wake-word detector + persist |
 | `set_launch_at_login` | invoke | Toggle OS autostart entry + persist. Returns actual OS state. |
 | `store_tokens` / `get_access_token` / `clear_tokens` / `refresh_tokens` | invoke | OS keyring token management |
 | `request_permission` | invoke | Trigger OS mic / screen permission prompt |
@@ -187,7 +181,6 @@ All renderer → Rust communication goes through `window.api` (defined in [`taur
 | `capture-end` | Rust → renderer | Dismiss overlay |
 | `query-result` | Rust → renderer | AI response payload |
 | `query-error` | Rust → renderer | Error string from backend |
-| `wake-word-error` | Rust → renderer | Mic / ONNX error (shown as toast in settings) |
 
 ---
 
@@ -240,7 +233,13 @@ Close and reopen your terminal after running this.
 
 ## CI / Releases
 
-The GitHub Actions workflow at [`.github/workflows/release.yml`](../.github/workflows/release.yml) builds all four platform targets in parallel on every version tag.
+Three GitHub Actions workflows (all under [`.github/workflows/`](../.github/workflows/)):
+
+| Workflow | When | What |
+|---|---|---|
+| `ci.yml` | every push / PR | Backend ruff + pytest; desktop tsc, clippy (Linux + Windows), unit tests |
+| `package.yml` | PRs touching `hoverai-desktop/`, or manually | Installers built with the `release-fast` profile (no LTO), uploaded as **artifacts** on the run page: Windows NSIS + MSI, macOS universal DMG, Linux AppImage + deb. Kept 14 days. |
+| `release.yml` | `v*` tags, or manually | Full `release` profile, same platforms; creates a **draft** GitHub release |
 
 ### One-time setup
 
@@ -249,6 +248,24 @@ Add this secret in **GitHub → repo → Settings → Secrets and variables → 
 | Secret | Value |
 |---|---|
 | `VITE_API_BASE` | `https://your-backend.onrender.com/api/v1` |
+| `TAURI_SIGNING_PRIVATE_KEY` | Contents of the private key from `pnpm tauri signer generate` (signs auto-updates; `release.yml` fails without it) |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Its password (empty if none) |
+
+`release.yml` fails if it is missing. `package.yml` only warns and builds against `http://localhost:8000` (this also happens for PRs from forks, which never receive secrets).
+
+### Test a PR build
+
+Open the PR's **Package** run → *Artifacts* → download `hoverai-windows-<sha>` (or the macOS / Linux one) → install it in the Windows VM / on the test machine. Builds are unsigned: Windows SmartScreen needs *More info → Run anyway*, macOS needs right-click → *Open*.
+
+### Auto-updates
+
+Installed apps check `https://github.com/TheCodeCheff123/HoverAi/releases/latest/download/latest.json` a few seconds after starting (release builds only) and from **Settings → Updates**. To ship an update:
+
+1. Bump the version in `package.json`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml` (it must be higher than the installed one).
+2. Tag and push (below) — `release.yml` builds, signs the update bundles and attaches `latest.json` to a **draft** release.
+3. **Publish** the draft. Only then do installed apps see it.
+
+Windows and macOS installs update in place; on Linux only the **AppImage** can update itself (`.deb` installs need a manual reinstall). Never lose the private key: copies signed with it can't accept updates from a new key and would need a manual reinstall.
 
 ### Trigger a release
 
@@ -257,9 +274,24 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-This creates a **draft release** with installers for Windows, macOS Apple Silicon, macOS Intel, and Linux attached. Review the draft and publish when ready.
+This creates a **draft release** with installers for Windows, macOS (universal: Apple Silicon + Intel) and Linux attached. Review the draft and publish when ready.
 
 You can also trigger a build manually from **GitHub → Actions → Release → Run workflow**.
+
+---
+
+## Linux: X11 vs Wayland
+
+| | X11 | Wayland |
+|---|---|---|
+| Capture shortcut | `tauri-plugin-global-shortcut` (X11 key grab) | XDG **GlobalShortcuts portal**, shortcut id `capture`. GNOME/KDE ask the user to confirm the key; Hyprland lists it in `hyprctl globalshortcuts` and needs `bind = …, global, com.hoverai.desktop:capture`. Fallback on any compositor: a keybind running `hoverai-desktop --trigger`. |
+| Esc to dismiss | Global (works without focus) | Only while the overlay has focus |
+| Screenshot | xcap | xcap, `grim` fallback (wlroots compositors) |
+| Accessibility elements | AT-SPI, screen coordinates | AT-SPI, window-relative coordinates (+ Hyprland IPC for the focused window) |
+| Click-through overlay | GDK input region | GDK input region |
+| Window placement | App positions the overlay | Hyprland ignores client positioning — needs float/pin/size window rules |
+
+Tested so far: **Hyprland 0.56 (Wayland)** only. GNOME and KDE on Wayland and any X11 session are expected to work through the paths above but are **untested**. In all sessions, Chromium/Electron apps expose accessibility elements only when started with `--force-renderer-accessibility`; terminals, Zed and games expose none (the model falls back to vision-only targets).
 
 ---
 
@@ -268,7 +300,6 @@ You can also trigger a build manually from **GitHub → Actions → Release → 
 | Area | Detail |
 |---|---|
 | **Cross-compilation** | You cannot build macOS installers from Windows. Each platform must be built on its native OS (or use the CI runners). |
-| **Wake-word in dev** | The wake-word detector starts on a background thread at launch if previously enabled. In `pnpm tauri dev` it uses the debug binary path — expected behaviour. |
 | **WiX timeout** | On slow connections, the WiX download during `pnpm build:win` may time out. Pre-download WiX using the PowerShell snippet above. |
 | **Render cold start** | The free-tier Render.com backend sleeps after inactivity. The first API call after sleep takes 30–50 s. The settings page loads instantly from local data; server data merges in once it responds. |
 | **Linux Secret Service** | Token storage falls back to plain JSON if `libsecret` / KWallet is not running (e.g. minimal desktop environments). |

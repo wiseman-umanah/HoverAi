@@ -47,7 +47,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' http://localhost:* https://hover-ai-backend.onrender.com https://*.onrender.com"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' http://localhost:* https://hover-ai-backend.onrender.com https://*.onrender.com https://*.ngrok-free.app https://*.ngrok-free.dev https://*.ngrok.app"
     },
     "macOSPrivateApi": true
   },
@@ -61,11 +61,20 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": {
-      "resources/hey_hover.onnx": "resources/hey_hover.onnx"
-    },
     "macOS": {
       "infoPlist": "Info.plist"
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUzMDU0RTE3MDg1MEJGNUQKUldSZHYxQUlGMDRGNDd5bjhiWVhaUGJFRnVyVlFjN1lMVlZKbkZDR0V0WHR4Y1FzMDI3TGE3RWkK",
+      "endpoints": [
+        "https://github.com/TheCodeCheff123/HoverAi/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

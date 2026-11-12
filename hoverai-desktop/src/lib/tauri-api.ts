@@ -68,15 +68,6 @@ export function saveSettings(settings: AppSettings): Promise<void> {
   return invoke<void>('save_settings', { s: settings })
 }
 
-export function setWakeWordEnabled(enabled: boolean): Promise<void> {
-  return invoke<void>('set_wake_word_enabled', { enabled })
-}
-
-/** False unless the app was built with the `wake-word` Cargo feature. */
-export function wakeWordAvailable(): Promise<boolean> {
-  return invoke<boolean>('wake_word_available')
-}
-
 /** Returns the actual OS state after the call. Throws a string error if the OS rejected it. */
 export function setLaunchAtLogin(enabled: boolean): Promise<boolean> {
   return invoke<boolean>('set_launch_at_login', { enabled })
@@ -218,10 +209,6 @@ export function onQueryError(cb: (message: string) => void): () => void {
   return subscribe<string>('query-error', cb)
 }
 
-export function onWakeWordError(cb: (message: string) => void): () => void {
-  return subscribe<string>('wake-word-error', cb)
-}
-
 /** Emitted to the main window when the session ends (sign-out or rejected token). */
 export function onSignedOut(cb: () => void): () => void {
   return subscribe<void>('signed-out', () => cb())
@@ -247,6 +234,38 @@ export function closeMainWindow(): void {
   getCurrentWebviewWindow().hide().catch(console.error)
 }
 
+// ─── Updates (tauri-plugin-updater, driven from Rust — see updater.rs) ───────
+
+export interface UpdateInfo {
+  version: string
+  currentVersion: string
+  notes: string | null
+}
+
+export function appVersion(): Promise<string> {
+  return invoke<string>('app_version')
+}
+
+/** Null when up to date. Rejects with a readable message if the check failed. */
+export function checkForUpdate(): Promise<UpdateInfo | null> {
+  return invoke<UpdateInfo | null>('check_for_update')
+}
+
+/** Downloads, installs and restarts the app; only resolves/rejects on failure. */
+export function installUpdate(): Promise<void> {
+  return invoke<void>('install_update')
+}
+
+/** Rust found an update at startup and opened Settings. */
+export function onUpdateAvailable(cb: (info: UpdateInfo) => void): () => void {
+  return subscribe<UpdateInfo>('update-available', cb)
+}
+
+/** Download progress 0–1, or -1 when the size is unknown. */
+export function onUpdateProgress(cb: (progress: number) => void): () => void {
+  return subscribe<number>('update-progress', cb)
+}
+
 // ─── window.api ──────────────────────────────────────────────────────────────
 
 declare global {
@@ -266,8 +285,6 @@ const tauriApi = {
   platformInfo,
   getSettings,
   saveSettings,
-  setWakeWordEnabled,
-  wakeWordAvailable,
   setLaunchAtLogin,
   storeTokens,
   getAccessToken,
@@ -287,12 +304,16 @@ const tauriApi = {
   micMonitorStop,
   onQueryResult,
   onQueryError,
-  onWakeWordError,
   onSignedOut,
   closeSettingsWindow,
   signOut,
   quitApp,
   closeMainWindow,
+  appVersion,
+  checkForUpdate,
+  installUpdate,
+  onUpdateAvailable,
+  onUpdateProgress,
 }
 
 if (typeof window !== 'undefined') {

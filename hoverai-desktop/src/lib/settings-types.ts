@@ -10,7 +10,6 @@ export type AppSettings = {
   soundEffects: boolean
   notifications: boolean
   language: string
-  wakeWordEnabled: boolean
   voiceGender: 'female' | 'male'
   shortcutKey: string          // persisted accelerator e.g. "CmdOrCtrl+Shift+H"
 }

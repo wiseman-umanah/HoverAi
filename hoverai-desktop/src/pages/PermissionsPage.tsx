@@ -35,15 +35,6 @@ export default function PermissionsPage({ onComplete }: PermissionsPageProps) {
     microphone: 'idle',
     screen: 'idle',
   })
-  const [wakeWordEnabled, setWakeWordEnabled] = useState(false)
-  const [wakeWordAvailable, setWakeWordAvailable] = useState(false)
-
-  useEffect(() => {
-    window.api.getSettings().then((s) => {
-      setWakeWordEnabled(s.wakeWordEnabled)
-    }).catch(() => {})
-    window.api.wakeWordAvailable().then(setWakeWordAvailable).catch(() => {})
-  }, [])
 
   const allGranted = PERMISSIONS.every((p) => statuses[p.id] === 'granted')
 
@@ -72,12 +63,6 @@ export default function PermissionsPage({ onComplete }: PermissionsPageProps) {
     } catch {
       setStatuses((prev) => ({ ...prev, [id]: 'denied' }))
     }
-  }
-
-  async function handleWakeWordToggle() {
-    const next = !wakeWordEnabled
-    setWakeWordEnabled(next)
-    window.api.setWakeWordEnabled(next).catch(console.error)
   }
 
   return (
@@ -257,73 +242,6 @@ export default function PermissionsPage({ onComplete }: PermissionsPageProps) {
           )
         })}
 
-        {/* ── Wake word card — optional, only in builds with the wake-word feature ── */}
-        {wakeWordAvailable && (
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0, transition: { duration: 0.4, delay: 0.26, ease: [0.22, 1, 0.36, 1] as const } }}
-          style={{
-            display: 'flex', alignItems: 'center', gap: 16,
-            padding: '20px 24px',
-            borderRadius: 'var(--radius-lg)',
-            background: [
-              'linear-gradient(180deg, rgba(255,255,255,0.06) 0%, rgba(255,255,255,0.01) 100%) padding-box',
-              'linear-gradient(135deg, rgba(255,255,255,0.20) 0%, rgba(255,255,255,0.06) 35%, rgba(255,255,255,0.01) 70%, rgba(255,255,255,0.005) 100%) border-box',
-              'rgba(18,16,38,0.75) padding-box',
-            ].join(', '),
-            border: '1px solid transparent',
-            boxShadow: '0 4px 24px rgba(0,0,0,0.35), 0 1px 4px rgba(0,0,0,0.25)',
-          }}
-        >
-          <div
-            style={{
-              width: 52, height: 52, borderRadius: 'var(--radius-md)',
-              background: [
-                'linear-gradient(135deg, rgba(255,255,255,0.14) 0%, rgba(255,255,255,0.03) 60%, rgba(255,255,255,0.01) 100%) border-box',
-                'rgba(255,255,255,0.05) padding-box',
-              ].join(', '),
-              border: '1px solid transparent',
-              display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-            }}
-          >
-            <i className="ri-voice-recognition-line" style={{ fontSize: 24, color: wakeWordEnabled ? 'var(--accent)' : 'var(--text-secondary)', transition: 'color 0.2s' }} />
-          </div>
-
-          <div style={{ flex: 1 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
-              <p style={{ fontWeight: 700, fontSize: 17, color: 'var(--text-primary)' }}>&ldquo;Hey Hover&rdquo; wake word</p>
-              <span style={{ fontSize: 11, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--text-secondary)', background: 'rgba(255,255,255,0.07)', border: '1px solid rgba(255,255,255,0.12)', borderRadius: 4, padding: '2px 6px' }}>
-                Optional
-              </span>
-            </div>
-            <p style={{ fontSize: 14, color: 'var(--text-secondary)' }}>
-              {wakeWordEnabled ? 'Say "Hey Hover" to activate hands-free' : 'Activate without the shortcut key'}
-            </p>
-          </div>
-
-          <button
-            onClick={handleWakeWordToggle}
-            role="switch"
-            aria-checked={wakeWordEnabled}
-            style={{
-              width: 50, height: 28,
-              borderRadius: 'var(--radius-full)',
-              border: 'none', cursor: 'pointer', padding: 3,
-              background: wakeWordEnabled ? 'var(--accent)' : '#3a3a3a',
-              transition: 'background 0.25s',
-              display: 'flex', alignItems: 'center',
-              justifyContent: wakeWordEnabled ? 'flex-end' : 'flex-start',
-              flexShrink: 0,
-            }}
-          >
-            <motion.span
-              layout
-              transition={{ type: 'spring', stiffness: 500, damping: 30 }}
-              style={{ width: 22, height: 22, borderRadius: '50%', background: '#fff', display: 'block', boxShadow: '0 1px 4px rgba(0,0,0,0.3)', flexShrink: 0 }}
-            />
-          </button>
-        </motion.div>
-        )}
       </div>
 
       {/* ── CTA — pinned at bottom, never scrolls ── */}

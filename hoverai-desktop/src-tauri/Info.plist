@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>NSMicrophoneUsageDescription</key>
-  <string>HoverAI needs microphone access to detect the "Hey Hover" wake word.</string>
+  <string>HoverAI needs microphone access to hear your spoken questions.</string>
   <key>NSScreenCaptureUsageDescription</key>
   <string>HoverAI needs screen recording access to capture a screenshot when activated.</string>
 </dict>

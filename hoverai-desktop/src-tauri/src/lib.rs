@@ -19,8 +19,7 @@ mod hit_region;
 mod marks;
 mod settings;
 mod tokens;
-#[cfg(feature = "wake-word")]
-mod wake_word;
+mod updater;
 #[cfg(target_os = "linux")]
 mod wayland_shortcut;
 
@@ -44,8 +43,10 @@ use auth::{AuthError, Authed};
 pub fn api_base() -> String {
     // VITE_API_BASE is injected by build.rs reading hoverai-desktop/.env,
     // then emitting cargo:rustc-env=VITE_API_BASE=<value>.
-    // option_env! picks that up at compile time. Falls back to localhost.
+    // option_env! picks that up at compile time. Falls back to localhost when
+    // unset or empty (CI writes `VITE_API_BASE=` if the secret is missing).
     option_env!("VITE_API_BASE")
+        .filter(|v| !v.is_empty())
         .unwrap_or("http://localhost:8000/api/v1")
         .to_string()
 }
@@ -81,9 +82,6 @@ struct AppState {
     mic_monitor: Mutex<Option<audio::Recording>>,
     /// Interactive rectangles reported by the overlay (CSS px); see hit_region.rs.
     hit_regions: Mutex<Vec<hit_region::Rect>>,
-    /// When Some, the wake-word detector is running. Drop or send to stop it.
-    #[cfg(feature = "wake-word")]
-    wake_word_stop: Mutex<Option<std::sync::mpsc::SyncSender<wake_word::StopSignal>>>,
 }
 
 fn state(app: &AppHandle) -> &AppState {
@@ -153,8 +151,7 @@ async fn show_overlay_focused(overlay: &WebviewWindow) {
 fn hide_overlay(app: &AppHandle) {
     if let Some(o) = get_overlay(app) {
         let _ = o.hide();
-        let _ = o.set_ignore_cursor_events(true);
-        hit_region::invalidate();
+        hit_region::set_click_through(&o);
     }
 }
 
@@ -204,14 +201,6 @@ pub async fn trigger_capture(app: AppHandle) {
         Phase::Idle => start_capture(app).await,
         Phase::Recording => submit_capture(app).await,
         Phase::Thinking | Phase::Showing => cancel_capture(&app),
-    }
-}
-
-/// The wake word only ever starts a capture; it never cancels one.
-#[cfg(feature = "wake-word")]
-pub async fn trigger_from_wake_word(app: AppHandle) {
-    if phase(&app) == Phase::Idle {
-        start_capture(app).await;
     }
 }
 
@@ -289,8 +278,7 @@ async fn submit_capture(app: AppHandle) {
     let _ = app.emit_to("overlay", "capture-submitted", ());
     // While thinking only a small progress bar is drawn; let clicks through.
     if let Some(o) = get_overlay(&app) {
-        let _ = o.set_ignore_cursor_events(true);
-        hit_region::invalidate();
+        hit_region::set_click_through(&o);
     }
 
     let rec = state(&app).recording.lock().unwrap().take();
@@ -659,9 +647,7 @@ fn save_settings(app: AppHandle, s: settings::AppSettings) {
     // renderer must not overwrite it.
     let mut s = s;
     s.shortcut_key = settings::load(&app).shortcut_key;
-    let wake_enabled = s.wake_word_enabled;
     settings::save(&app, &s);
-    apply_wake_word_setting(&app, wake_enabled);
 }
 
 /// Toggle OS launch-at-login via tauri-plugin-autostart.
@@ -694,41 +680,6 @@ fn set_launch_at_login(app: AppHandle, enabled: bool) -> Result<bool, String> {
             Err(e)
         }
     }
-}
-
-/// Start the detector if `enabled` is true and it isn't running; stop it if false.
-#[cfg(feature = "wake-word")]
-fn apply_wake_word_setting(app: &AppHandle, enabled: bool) {
-    let mut guard = state(app).wake_word_stop.lock().unwrap();
-    if enabled {
-        if guard.is_none() {
-            let tx = wake_word::start(app.clone());
-            *guard = Some(tx);
-            log::info!("[wake-word] started");
-        }
-    } else if guard.take().is_some() {
-        // Dropping the sender signals the detector thread to stop.
-        log::info!("[wake-word] stopped");
-    }
-}
-
-/// Built without the `wake-word` feature: the setting is persisted but ignored.
-#[cfg(not(feature = "wake-word"))]
-fn apply_wake_word_setting(_app: &AppHandle, _enabled: bool) {}
-
-/// Whether this build includes the wake-word detector (the UI hides it if not).
-#[tauri::command]
-fn wake_word_available() -> bool {
-    cfg!(feature = "wake-word")
-}
-
-/// IPC command so the renderer can toggle wake-word without a full settings save.
-#[tauri::command]
-fn set_wake_word_enabled(app: AppHandle, enabled: bool) {
-    let mut s = settings::load(&app);
-    s.wake_word_enabled = enabled;
-    settings::save(&app, &s);
-    apply_wake_word_setting(&app, enabled);
 }
 
 #[tauri::command]
@@ -887,7 +838,11 @@ fn launch_overlay(app: AppHandle) {
 
 #[tauri::command]
 fn open_settings_window(app: AppHandle) {
-    if let Some(w) = get_settings_win(&app) {
+    show_settings(&app);
+}
+
+pub(crate) fn show_settings(app: &AppHandle) {
+    if let Some(w) = get_settings_win(app) {
         let _ = w.show();
         let _ = w.set_focus();
     }
@@ -924,7 +879,6 @@ fn end_session(app: &AppHandle, revoke: bool) {
     cancel_capture(app);
     unregister_active_shortcut(app);
     unbind_platform_shortcut();
-    apply_wake_word_setting(app, false);
     close_settings_window(app.clone());
     let _ = app.emit_to("main", "signed-out", ());
     show_main_window(app);
@@ -962,7 +916,6 @@ fn quit(app: &AppHandle) {
     if let Some(m) = state(app).mic_monitor.lock().unwrap().take() {
         std::thread::spawn(move || m.cancel());
     }
-    apply_wake_word_setting(app, false);
     unbind_platform_shortcut();
     let _ = app.global_shortcut().unregister_all();
     std::thread::spawn(|| {
@@ -1025,6 +978,7 @@ pub fn run() {
             None,
         ))
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState {
             active_shortcut: Mutex::new(String::new()),
             http,
@@ -1033,8 +987,6 @@ pub fn run() {
             screenshot: Mutex::new(None),
             mic_monitor: Mutex::new(None),
             hit_regions: Mutex::new(Vec::new()),
-            #[cfg(feature = "wake-word")]
-            wake_word_stop: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             // Permissions
@@ -1051,8 +1003,6 @@ pub fn run() {
             get_settings,
             save_settings,
             get_active_shortcut,
-            set_wake_word_enabled,
-            wake_word_available,
             set_launch_at_login,
             // Shortcuts
             test_shortcut,
@@ -1071,6 +1021,10 @@ pub fn run() {
             close_settings_window,
             sign_out,
             quit_app,
+            // Updates
+            updater::app_version,
+            updater::check_for_update,
+            updater::install_update,
         ])
         .setup(|app| {
             log::info!(
@@ -1081,6 +1035,7 @@ pub fn run() {
             setup_tray(app)?;
             hit_region::start_poller(app.handle().clone());
             startup(app.handle().clone());
+            updater::check_on_startup(app.handle().clone(), is_onboarded(app.handle()));
 
             let saved = settings::load(app.handle());
 
@@ -1096,14 +1051,6 @@ pub fn run() {
                 }
             }
 
-            // Start wake-word detector off the main thread — cpal + ONNX Runtime
-            // load native DLLs that must not block or crash the Tauri event loop.
-            if cfg!(feature = "wake-word") && saved.wake_word_enabled {
-                let handle = app.handle().clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    apply_wake_word_setting(&handle, true);
-                });
-            }
             Ok(())
         })
         .on_window_event(|window, event| {

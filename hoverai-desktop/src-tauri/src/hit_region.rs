@@ -42,6 +42,21 @@ impl Rect {
     }
 }
 
+/// Make the whole overlay click-through.
+///
+/// On Linux this must not use `set_ignore_cursor_events(true)`: tao 0.35
+/// unwraps the GdkWindow, which doesn't exist until the window has been shown
+/// once, and that panic inside a GTK callback aborts the whole app (it crashed
+/// at the end of onboarding, when the never-shown overlay was hidden).
+/// `apply` sets the same 1×1 input region but skips unrealised windows.
+pub fn set_click_through(overlay: &WebviewWindow) {
+    #[cfg(target_os = "linux")]
+    apply(overlay, Vec::new());
+    #[cfg(not(target_os = "linux"))]
+    let _ = overlay.set_ignore_cursor_events(true);
+    invalidate();
+}
+
 /// Restrict the overlay's mouse input to `rects` (empty = fully click-through).
 #[cfg(target_os = "linux")]
 pub fn apply(overlay: &WebviewWindow, rects: Vec<Rect>) {

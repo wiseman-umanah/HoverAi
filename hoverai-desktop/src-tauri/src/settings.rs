@@ -40,7 +40,6 @@ pub struct AppSettings {
     pub sound_effects: bool,
     pub notifications: bool,
     pub language: String,
-    pub wake_word_enabled: bool,
     pub voice_gender: VoiceGender,
     pub shortcut_key: String,      // e.g. "CmdOrCtrl+Shift+H"
 }
@@ -56,7 +55,6 @@ impl Default for AppSettings {
             sound_effects: true,
             notifications: true,
             language: "en-pidgin".to_string(),
-            wake_word_enabled: false,
             voice_gender: VoiceGender::Female,
             shortcut_key: String::new(),
         }

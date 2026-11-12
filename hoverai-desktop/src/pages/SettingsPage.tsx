@@ -5,7 +5,7 @@ import LangDropdown, { toDropdownLanguage, type Language } from '@renderer/compo
 import { api, ApiError } from '@renderer/lib/api'
 import { displayShortcut, formatCombo, toAccelerator } from '@renderer/lib/shortcuts'
 import type { UserResponse, ConversationHistory, ConversationDay, ConversationMessage } from '@renderer/lib/api'
-import { onWakeWordError, setLaunchAtLogin } from '@renderer/lib/tauri-api'
+import { setLaunchAtLogin, type UpdateInfo } from '@renderer/lib/tauri-api'
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
@@ -23,22 +23,7 @@ export default function SettingsPage() {
     'idle' | 'listening' | 'testing' | 'available' | 'taken'
   >('idle')
   const testingRef = useRef(false)
-  const [wakeWordError, setWakeWordError] = useState<string | null>(null)
-  const [wakeWordAvailable, setWakeWordAvailable] = useState(false)
-
-  useEffect(() => {
-    window.api.wakeWordAvailable().then(setWakeWordAvailable).catch(() => {})
-  }, [])
   const [autostartError, setAutostartError] = useState<string | null>(null)
-
-  // Subscribe to wake-word errors from Rust (mic permission denied, device missing, etc.)
-  useEffect(() => {
-    const unsub = onWakeWordError((msg) => {
-      setWakeWordError(`Wake word microphone error: ${msg}`)
-      setTimeout(() => setWakeWordError(null), 6000)
-    })
-    return unsub
-  }, [])
 
   // Fetch available languages on mount — no auth required
   useEffect(() => {
@@ -78,7 +63,6 @@ export default function SettingsPage() {
                   micSensitivity: serverSettings.mic_sensitivity,
                   soundEffects: serverSettings.sound_effects,
                   notifications: serverSettings.notifications,
-                  wakeWordEnabled: serverSettings.wake_word_enabled,
                   launchAtLogin: serverSettings.launch_at_login,
                   showInTaskbar: serverSettings.show_in_taskbar,
                   voiceGender: serverSettings.voice_gender,
@@ -92,7 +76,7 @@ export default function SettingsPage() {
       setSettings({
         launchAtLogin: false, showInTaskbar: false, overlayOpacity: 1,
         overlaySize: 'default', micSensitivity: 5, soundEffects: true,
-        notifications: true, language: 'en', wakeWordEnabled: false,
+        notifications: true, language: 'en',
         voiceGender: 'female', shortcutKey: '',
       })
     })
@@ -173,7 +157,6 @@ export default function SettingsPage() {
         micSensitivity: 'mic_sensitivity',
         soundEffects: 'sound_effects',
         notifications: 'notifications',
-        wakeWordEnabled: 'wake_word_enabled',
         launchAtLogin: 'launch_at_login',
         showInTaskbar: 'show_in_taskbar',
         voiceGender: 'voice_gender',
@@ -392,51 +375,6 @@ export default function SettingsPage() {
           <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
         </Card>
 
-        {/* ── Voice sensitivity ────────────────────────────────────────── */}
-        <Card>
-          <p
-            style={{
-              fontSize: 16,
-              fontWeight: 700,
-              color: 'var(--text-primary)',
-              marginBottom: 14,
-            }}
-          >
-            Voice sensitivity
-          </p>
-          <Slider
-            value={settings.micSensitivity}
-            min={1}
-            max={10}
-            onChange={(v) => update('micSensitivity', v)}
-          />
-        </Card>
-
-        {/* ── Always-on wake word (only in builds with the wake-word feature) ── */}
-        {wakeWordAvailable && (
-        <Card>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <div>
-              <p style={{ fontSize: 16, fontWeight: 700, color: 'var(--text-primary)' }}>
-                Always-on wake word
-              </p>
-              <p style={{ fontSize: 14, color: 'var(--text-secondary)', marginTop: 3 }}>
-                Say &ldquo;Hey Hover&rdquo; instead of the shortcut
-              </p>
-            </div>
-            <Toggle
-              checked={settings.wakeWordEnabled}
-              onChange={(v) => update('wakeWordEnabled', v)}
-            />
-          </div>
-          {wakeWordError && (
-            <p style={{ marginTop: 8, fontSize: 13, color: '#f87171' }}>
-              ⚠ {wakeWordError}
-            </p>
-          )}
-        </Card>
-        )}
-
         {/* ── Voice gender ─────────────────────────────────────────────── */}
         <Card>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -502,6 +440,8 @@ export default function SettingsPage() {
             </p>
           )}
         </Card>
+
+        <UpdatesCard />
 
         {/* ── Account ─────────────────────────────────────────────────── */}
         <SectionLabel icon="ri-user-3-line">Account</SectionLabel>
@@ -711,77 +651,94 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean
   )
 }
 
-function Slider({
-  value,
-  min,
-  max,
-  onChange,
-}: {
-  value: number
-  min: number
-  max: number
-  onChange: (v: number) => void
-}) {
-  const pct = ((value - min) / (max - min)) * 100
+// ─── Updates card ─────────────────────────────────────────────────────────────
+
+type UpdateState =
+  | { kind: 'idle' | 'checking' | 'current' }
+  | { kind: 'available'; info: UpdateInfo }
+  | { kind: 'installing'; info: UpdateInfo; progress: number }
+  | { kind: 'error'; message: string }
+
+function UpdatesCard() {
+  const [version, setVersion] = useState('')
+  const [state, setState] = useState<UpdateState>({ kind: 'idle' })
+
+  const check = useCallback(() => {
+    setState({ kind: 'checking' })
+    window.api.checkForUpdate()
+      .then((info) => setState(info ? { kind: 'available', info } : { kind: 'current' }))
+      .catch((e) => setState({ kind: 'error', message: `Couldn't check for updates: ${String(e)}` }))
+  }, [])
+
+  useEffect(() => {
+    window.api.appVersion().then(setVersion).catch(() => {})
+    const offAvailable = window.api.onUpdateAvailable((info) => setState({ kind: 'available', info }))
+    const offProgress = window.api.onUpdateProgress((progress) =>
+      setState((s) => (s.kind === 'installing' ? { ...s, progress } : s)))
+    return () => { offAvailable(); offProgress() }
+  }, [])
+
+  function install(info: UpdateInfo) {
+    setState({ kind: 'installing', info, progress: 0 })
+    // Resolves only if something went wrong — on success the app restarts.
+    window.api.installUpdate().catch((e) => setState({ kind: 'error', message: String(e) }))
+  }
+
+  const status =
+    state.kind === 'checking' ? 'Checking…'
+    : state.kind === 'current' ? 'You have the latest version.'
+    : state.kind === 'available' ? `Version ${state.info.version} is available.`
+    : state.kind === 'installing'
+      ? state.progress < 0 ? 'Downloading update…' : `Downloading update… ${Math.round(state.progress * 100)}%`
+    : state.kind === 'error' ? state.message
+    : 'Updates are installed from HoverAI releases.'
+
+  const buttonStyle: React.CSSProperties = {
+    padding: '9px 18px',
+    borderRadius: 'var(--radius-full)',
+    border: '1px solid rgba(255,255,255,0.12)',
+    background: 'rgba(255,255,255,0.05)',
+    color: 'var(--text-primary)',
+    fontSize: 14,
+    fontWeight: 600,
+    cursor: 'pointer',
+    flexShrink: 0,
+  }
 
   return (
-    <div style={{ position: 'relative', height: 24, display: 'flex', alignItems: 'center' }}>
-      {/* Track */}
-      <div
-        style={{
-          position: 'absolute',
-          left: 0,
-          right: 0,
-          height: 4,
-          borderRadius: 2,
-          background: 'rgba(255,255,255,0.12)',
-        }}
-      />
-      {/* Fill */}
-      <div
-        style={{
-          position: 'absolute',
-          left: 0,
-          width: `${pct}%`,
-          height: 4,
-          borderRadius: 2,
-          background: 'rgba(255,255,255,0.35)',
-          pointerEvents: 'none',
-        }}
-      />
-      {/* Native input (invisible, on top) */}
-      <input
-        type="range"
-        min={min}
-        max={max}
-        value={value}
-        onChange={(e) => onChange(Number(e.target.value))}
-        style={{
-          position: 'absolute',
-          left: 0,
-          right: 0,
-          width: '100%',
-          opacity: 0,
-          cursor: 'pointer',
-          height: 24,
-          margin: 0,
-        }}
-      />
-      {/* Thumb */}
-      <div
-        style={{
-          position: 'absolute',
-          left: `calc(${pct}% - 11px)`,
-          width: 22,
-          height: 22,
-          borderRadius: '50%',
-          background: '#aeaeb2',
-          boxShadow: '0 1px 6px rgba(0,0,0,0.4)',
-          pointerEvents: 'none',
-          transition: 'left 0.05s',
-        }}
-      />
-    </div>
+    <Card>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
+        <div style={{ minWidth: 0 }}>
+          <p style={{ fontSize: 16, fontWeight: 700, color: 'var(--text-primary)' }}>
+            Updates{version && <span style={{ fontWeight: 500, color: 'var(--text-secondary)' }}> · v{version}</span>}
+          </p>
+          <p style={{ fontSize: 14, color: state.kind === 'error' ? '#f87171' : 'var(--text-secondary)', marginTop: 3 }}>
+            {status}
+          </p>
+        </div>
+        {state.kind === 'available' ? (
+          <button
+            onClick={() => install(state.info)}
+            style={{ ...buttonStyle, background: 'var(--accent)', border: '1px solid transparent', color: '#fff' }}
+          >
+            Install & restart
+          </button>
+        ) : (
+          <button
+            onClick={check}
+            disabled={state.kind === 'checking' || state.kind === 'installing'}
+            style={{ ...buttonStyle, opacity: state.kind === 'checking' || state.kind === 'installing' ? 0.5 : 1 }}
+          >
+            Check for updates
+          </button>
+        )}
+      </div>
+      {state.kind === 'installing' && state.progress >= 0 && (
+        <div style={{ marginTop: 12, height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.08)', overflow: 'hidden' }}>
+          <div style={{ width: `${state.progress * 100}%`, height: '100%', background: 'var(--accent)', transition: 'width 0.2s' }} />
+        </div>
+      )}
+    </Card>
   )
 }
 

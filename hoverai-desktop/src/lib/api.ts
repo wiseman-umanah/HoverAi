@@ -10,7 +10,7 @@
 
 // Renderer process: Vite replaces import.meta.env.VITE_API_BASE at build time.
 // Falls back to localhost for safety — override via hoverai-desktop/.env
-export const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8000/api/v1'
+export const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000/api/v1'
 
 
 // ─── Error types ──────────────────────────────────────────────────────────────
@@ -53,7 +53,6 @@ export type UserSettingsResponse = {
   mic_sensitivity: number
   sound_effects: boolean
   notifications: boolean
-  wake_word_enabled: boolean
   launch_at_login: boolean
   show_in_taskbar: boolean
   voice_gender: 'female' | 'male'
@@ -109,6 +108,9 @@ async function request<T>(
   const headers: Record<string, string> = {
     ...(fetchOptions.headers as Record<string, string>),
   }
+  // ngrok's free tier answers browser-like requests (the webview's fetch) with
+  // an HTML warning page unless this header is present.
+  if (API_BASE.includes('.ngrok')) headers['ngrok-skip-browser-warning'] = '1'
 
   let token: string | null = null
   if (!skipAuth) {
