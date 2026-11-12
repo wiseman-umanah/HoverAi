@@ -276,6 +276,56 @@ def _parse_agent_response(raw: str) -> dict[str, Any]:
     return data
 
 
+def _coerce_bool(value: Any) -> bool:
+    """Strictly convert a model-provided flag to bool.
+
+    ``bool("false")`` is ``True``, so strings are matched explicitly.
+
+    Args:
+        value: A JSON boolean, ``"true"``/``"false"`` string, 0/1, or None.
+
+    Returns:
+        The boolean value (None → False).
+
+    Raises:
+        ValueError: For anything else.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise ValueError(f"goal_achieved is not a boolean: {value!r}")
+
+
+def _coerce_float(data: dict[str, Any], key: str, default: float) -> float:
+    """Read a numeric field, using ``default`` when it is missing or null.
+
+    Args:
+        data: Parsed model response dictionary.
+        key: Field name.
+        default: Value for a missing/null field.
+
+    Returns:
+        The field as a float.
+
+    Raises:
+        ValueError: If the field is present but not numeric.
+    """
+    value = data.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        raise ValueError(f"{key} is not a number: {value!r}")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} is not a number: {value!r}") from exc
+
+
 def _build_action(data: dict[str, Any]) -> AgentAction:
     """Build an AgentAction from a parsed model response dict.
 
@@ -284,19 +334,41 @@ def _build_action(data: dict[str, Any]) -> AgentAction:
 
     Returns:
         A validated ``AgentAction`` instance.
+
+    Raises:
+        ValueError: On a non-numeric coordinate or an unknown ``action`` /
+            ``direction`` (pydantic's ``ValidationError`` is a ``ValueError``).
     """
     return AgentAction(
-        action=data.get("action", "click"),
-        instruction=data.get("instruction", ""),
-        x=float(data.get("x", 0.5)),
-        y=float(data.get("y", 0.5)),
-        w=float(data.get("w", 0.05)),
-        h=float(data.get("h", 0.05)),
+        action=data.get("action") or "click",
+        instruction=data.get("instruction") or "",
+        x=_coerce_float(data, "x", 0.5),
+        y=_coerce_float(data, "y", 0.5),
+        w=_coerce_float(data, "w", 0.05),
+        h=_coerce_float(data, "h", 0.05),
         text=data.get("text"),
         keys=data.get("keys"),
         direction=data.get("direction"),
         amount=data.get("amount"),
     )
+
+
+def _parse_turn(raw: str) -> tuple[dict[str, Any], AgentAction, bool]:
+    """Parse, validate and convert one model reply.
+
+    Args:
+        raw: Raw model output string.
+
+    Returns:
+        ``(data, action, goal_achieved)``.
+
+    Raises:
+        ValueError: If the reply is not valid JSON, misses fields, or has
+            values of the wrong type.
+    """
+    data = _parse_agent_response(raw)
+    goal_achieved = _coerce_bool(data.get("goal_achieved"))
+    return data, _build_action(data), goal_achieved
 
 
 def _screenshot_user_content(
@@ -472,17 +544,11 @@ async def _run_turn(session: _Session, tts_voice: str) -> AgentResponse:
     # Must happen here so images are already removed when token cost is counted.
     _prune_history(session)
 
-    # ── Call the model ────────────────────────────────────────────────────────
+    # ── Call the model; one retry on an LLM error or an unusable reply ──────
     raw = ""
+    parsed: tuple[dict[str, Any], AgentAction, bool] | None = None
+    failure = "LLM error — please try again."
     for attempt in range(2):
-        if attempt == 1:
-            session.messages.append({
-                "role": "user",
-                "content": (
-                    "Your previous response was not valid JSON. "
-                    "Return ONLY the raw JSON object, no markdown, no <think> tags."
-                ),
-            })
         try:
             resp = await groq_client.chat.completions.create(
                 model=settings.vision_model,
@@ -495,38 +561,47 @@ async def _run_turn(session: _Session, tts_voice: str) -> AgentResponse:
                 "Agent LLM raw response (turn %d, attempt %d): %s",
                 session.turn, attempt + 1, raw[:500],
             )
-            break
         except Exception as exc:
             logger.error("Agent LLM error (turn %d, attempt %d): %s", session.turn, attempt + 1, exc)
-            if attempt == 1:
-                speech_b64 = await _safe_tts("Something went wrong — please try again.", tts_voice)
-                return AgentResponse(
-                    session_id=session.session_id,
-                    action=None,
-                    summary="LLM error — please try again.",
-                    speech_b64=speech_b64,
-                    done=True,
-                    turn=session.turn,
-                )
+            failure = "LLM error — please try again."
+            continue
 
-    # ── Parse response ────────────────────────────────────────────────────────
-    try:
-        data = _parse_agent_response(raw)
-    except ValueError as exc:
-        logger.error("Agent parse error: %s | raw was: %r", exc, raw[:600])
-        speech_b64 = await _safe_tts("I got confused — please try again.", tts_voice)
+        try:
+            parsed = _parse_turn(raw)
+            break
+        except ValueError as exc:
+            logger.error("Agent parse error (attempt %d): %s | raw was: %r", attempt + 1, exc, raw[:600])
+            failure = "Could not parse model response."
+            if attempt == 0:
+                session.messages.append({"role": "assistant", "content": raw})
+                session.messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Your previous response was invalid ({exc}). "
+                        "Return ONLY the raw JSON object with the documented fields, "
+                        "no markdown, no <think> tags."
+                    ),
+                })
+
+    if parsed is None:
+        _sessions.pop(session.session_id, None)
+        spoken = (
+            "I got confused — please try again."
+            if failure.startswith("Could not parse")
+            else "Something went wrong — please try again."
+        )
+        speech_b64 = await _safe_tts(spoken, tts_voice)
         return AgentResponse(
             session_id=session.session_id,
             action=None,
-            summary="Could not parse model response.",
+            summary=failure,
             speech_b64=speech_b64,
             done=True,
             turn=session.turn,
         )
 
-    spoken_reply: str = data.get("spoken_reply", "On it!")
-    goal_achieved: bool = bool(data.get("goal_achieved", False))
-    action = _build_action(data)
+    data, action, goal_achieved = parsed
+    spoken_reply: str = data.get("spoken_reply") or "On it!"
 
     # ── Append model response to history ─────────────────────────────────────
     session.messages.append({"role": "assistant", "content": raw})

@@ -48,13 +48,15 @@ produces a better transcript for code-switched African languages.
 
 import asyncio
 import base64
+import io
 import json
 import logging
-import subprocess
 import time
+import wave
 from collections.abc import AsyncIterator
 
 from app.config import settings
+from app.services.audio import convert_to_wav
 from app.services.stt import LANGUAGE_MAP
 
 logger = logging.getLogger(__name__)
@@ -71,38 +73,27 @@ _CHUNK_BYTES: int = 3200
 _COMMIT_TIMEOUT_S: float = 15.0
 
 
-def _webm_to_pcm16(webm_bytes: bytes) -> bytes:
-    """Convert WebM/Opus audio to PCM 16-bit LE 16 kHz mono via ffmpeg.
+async def _to_pcm16(audio_bytes: bytes) -> bytes:
+    """Convert uploaded audio to raw PCM16 LE 16 kHz mono samples.
 
-    The the desktop MediaRecorder produces WebM audio.  Sahara streaming STT
-    expects raw PCM16 LE samples — no container, no header.
+    Sahara streaming STT expects bare samples — no container, no header.
+    v2 uploads are already 16 kHz mono WAV, so only the header is stripped;
+    anything else goes through ``convert_to_wav`` (async ffmpeg with a
+    timeout — the old synchronous ``subprocess.run`` blocked the event loop
+    with no time limit, B22).
 
     Args:
-        webm_bytes: Raw WebM bytes from the desktop MediaRecorder.
+        audio_bytes: Uploaded audio (WAV, or legacy WebM/Opus).
 
     Returns:
         Raw PCM16 LE bytes at 16 kHz mono.
 
     Raises:
-        RuntimeError: If ffmpeg is not installed or conversion fails.
+        AudioConversionError: If the audio cannot be decoded.
     """
-    result = subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-i", "pipe:0",
-            "-f", "s16le",
-            "-ar", "16000",
-            "-ac", "1",
-            "pipe:1",
-        ],
-        input=webm_bytes,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"ffmpeg PCM conversion failed: {result.stderr.decode()[:200]}"
-        )
-    return result.stdout
+    wav_bytes = await convert_to_wav(audio_bytes)
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        return wf.readframes(wf.getnframes())
 
 
 async def stream_transcribe(
@@ -147,11 +138,11 @@ async def stream_transcribe(
     start = time.monotonic()
     sahara_lang = LANGUAGE_MAP.get(language, "en")
 
-    # Step 1: convert WebM → raw PCM16 LE
+    # Step 1: convert to raw PCM16 LE
     try:
-        pcm_bytes = _webm_to_pcm16(webm_bytes)
+        pcm_bytes = await _to_pcm16(webm_bytes)
         logger.debug(
-            "Sahara stream STT: converted %dB WebM → %dB PCM16 LE",
+            "Sahara stream STT: converted %dB audio → %dB PCM16 LE",
             len(webm_bytes), len(pcm_bytes),
         )
     except Exception as exc:

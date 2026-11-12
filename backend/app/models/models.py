@@ -14,12 +14,25 @@ FK ``ondelete`` rules and JSONB are declared here so autogenerate sees them.
 """
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, ClassVar, Optional
 
 from sqlalchemy import JSON, Boolean
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Column, DateTime, Field, Relationship, SQLModel, func, text
+
+
+def _utcnow() -> datetime:
+    """Return the current time as a timezone-aware UTC datetime.
+
+    Replaces the deprecated ``datetime.utcnow`` (naive) as the Python-side
+    default for ``DateTime(timezone=True)`` columns.
+
+    Returns:
+        ``datetime.now(UTC)``.
+    """
+    return datetime.now(UTC)
+
 
 if TYPE_CHECKING:
     # Expose __tablename__ as ClassVar[str] to type checkers only.
@@ -59,7 +72,7 @@ class User(SQLModel, table=True):
     hashed_password: str
     language: str = Field(default="en-pidgin", max_length=20)
     created_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=_utcnow,
         sa_column=Column(DateTime(timezone=True), server_default=func.now(), nullable=False),
     )
 
@@ -100,7 +113,7 @@ class UserSettings(SQLModel, table=True):
     show_in_taskbar: bool = Field(default=False)
     voice_gender: str = Field(default="female", max_length=10)  # "female" | "male"
     updated_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=_utcnow,
         sa_column=Column(
             DateTime(timezone=True),
             server_default=func.now(),
@@ -146,7 +159,7 @@ class RefreshToken(SQLModel, table=True):
     )
     revoked: bool = Field(default=False)
     created_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=_utcnow,
         sa_column=Column(DateTime(timezone=True), server_default=func.now(), nullable=False),
     )
 
@@ -178,7 +191,7 @@ class QueryLog(SQLModel, table=True):
         default=None, foreign_key="users.id", ondelete="SET NULL", nullable=True
     )
     created_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=_utcnow,
         sa_column=Column(DateTime(timezone=True), server_default=func.now(), nullable=False),
     )
     language_used: str = Field(max_length=20)
@@ -227,11 +240,11 @@ class Conversation(SQLModel, table=True):
         foreign_key="users.id", ondelete="CASCADE", unique=True, index=True
     )
     created_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=_utcnow,
         sa_column=Column(DateTime(timezone=True), server_default=func.now(), nullable=False),
     )
     updated_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=_utcnow,
         sa_column=Column(
             DateTime(timezone=True),
             server_default=func.now(),
@@ -271,7 +284,7 @@ class ConversationMessage(SQLModel, table=True):
     role: str = Field(max_length=20)        # "user" | "assistant"
     content: str
     created_at: datetime = Field(
-        default_factory=datetime.utcnow,
+        default_factory=_utcnow,
         sa_column=Column(DateTime(timezone=True), server_default=func.now(), nullable=False),
     )
     summarised: bool = Field(

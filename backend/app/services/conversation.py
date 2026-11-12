@@ -7,7 +7,9 @@ two ``ConversationMessage`` rows (role=user + role=assistant).
 
 Context window fed to the LLM each request:
   1. rolling_summary (system message, if one exists)
-  2. Last LIVE_WINDOW un-summarised message pairs (most recent turns verbatim)
+  2. Every un-summarised message, oldest first (capped at the most recent
+     CONTEXT_WINDOW).  Messages are only marked summarised once they are in
+     the summary, so nothing falls between summary and context (B8).
 
 Rolling summary trigger
 ───────────────────────
@@ -20,13 +22,22 @@ At that point the oldest SUMMARISE_BATCH messages are:
 Constants:
   SUMMARISE_AFTER = 12  messages (= 6 full turns: user+assistant each)
   SUMMARISE_BATCH =  8  messages (= 4 oldest turns to fold into summary)
-  LIVE_WINDOW     =  4  messages kept verbatim (= 2 most recent turns)
+  CONTEXT_WINDOW  = 12  messages at most sent verbatim (normally 4–10;
+                        more only if summarisation keeps failing)
 
-Token cost per request (stable regardless of conversation length):
-  rolling_summary  ~80  tokens
-  4 live messages  ~600 tokens
-  ─────────────────────────────
-  total overhead   ~680 tokens
+Token cost per request (bounded regardless of conversation length):
+  rolling_summary     ~80   tokens
+  ≤10 live messages   ~400–1500 tokens (user transcripts + short answers)
+
+Concurrency (B9)
+────────────────
+``save_turn`` commits the new messages first, then calls the summary LLM
+with no transaction open, then *claims* the batch with
+``UPDATE … SET summarised = true WHERE id IN (…) AND NOT summarised``.  If
+any row was already claimed by a concurrent turn, the claim is rolled back
+and the summary discarded, so each message is summarised exactly once.  The
+conversation row is locked (``FOR UPDATE``, Postgres) while the summary is
+appended.
 
 Persistence strategy
 ────────────────────
@@ -41,7 +52,8 @@ import uuid
 from collections import defaultdict
 from typing import NamedTuple
 
-from sqlalchemy import select, update
+from sqlalchemy import update
+from sqlmodel import col, select
 
 from app.config import settings
 from app.db import AsyncSessionLocal
@@ -57,11 +69,15 @@ logger = logging.getLogger(__name__)
 SUMMARISE_AFTER: int = 12
 
 # How many of the oldest messages to fold into the summary when triggered.
-# Must be < SUMMARISE_AFTER.  Leaves LIVE_WINDOW messages verbatim.
+# Must be < SUMMARISE_AFTER.  The rest stay verbatim in the context.
 SUMMARISE_BATCH: int = 8
 
-# Messages kept verbatim in the context window (the most recent ones).
-LIVE_WINDOW: int = SUMMARISE_AFTER - SUMMARISE_BATCH  # = 4
+# Upper bound on un-summarised messages sent verbatim to the LLM.  While
+# summarisation works a request sees 4–10; the cap only matters while it fails.
+CONTEXT_WINDOW: int = SUMMARISE_AFTER
+
+# Maximum length of the rolling summary; older text is trimmed from the front.
+SUMMARY_MAX_CHARS: int = 400
 
 
 # ── In-memory fallback ────────────────────────────────────────────────────────
@@ -145,7 +161,7 @@ async def _db_get_or_create(user_id: uuid.UUID) -> ConversationContext:
     async with AsyncSessionLocal() as session:
         # Upsert: fetch existing or create new conversation row
         result = await session.execute(
-            select(Conversation).where(Conversation.user_id == user_id)
+            select(Conversation).where(col(Conversation.user_id) == user_id)
         )
         conv = result.scalar_one_or_none()
 
@@ -159,15 +175,14 @@ async def _db_get_or_create(user_id: uuid.UUID) -> ConversationContext:
         msgs_result = await session.execute(
             select(ConversationMessage)
             .where(
-                ConversationMessage.conversation_id == conv.id,
-                ConversationMessage.summarised == False,  # noqa: E712
+                col(ConversationMessage.conversation_id) == conv.id,
+                col(ConversationMessage.summarised) == False,  # noqa: E712
             )
-            .order_by(ConversationMessage.created_at)
+            .order_by(col(ConversationMessage.created_at))
         )
         messages = msgs_result.scalars().all()
 
-        # Keep only the LIVE_WINDOW most recent for the context
-        live = messages[-LIVE_WINDOW:] if len(messages) > LIVE_WINDOW else messages
+        live = messages[-CONTEXT_WINDOW:]
         recent = [{"role": m.role, "content": m.content} for m in live]
 
         await session.commit()
@@ -184,70 +199,101 @@ async def _db_save_turn(
     user_content: str,
     assistant_content: str,
 ) -> None:
-    async with AsyncSessionLocal() as session:
-        conv_uuid = uuid.UUID(conversation_id)
+    """Append a turn, then summarise the oldest batch if the window is full.
 
-        # Append the two new messages
+    Three short transactions so no DB connection is held through the LLM
+    call, and a claim step so concurrent turns never summarise the same rows
+    twice (see the module docstring).
+
+    Args:
+        user_id: Owner of the conversation (logging only).
+        conversation_id: The conversation's UUID string.
+        user_content: The user's transcript for this turn.
+        assistant_content: The assistant's answer for this turn.
+    """
+    conv_uuid = uuid.UUID(conversation_id)
+
+    # 1. Append the turn and read the oldest unsummarised messages.
+    async with AsyncSessionLocal() as session:
         session.add(ConversationMessage(
             conversation_id=conv_uuid, role="user", content=user_content
         ))
         session.add(ConversationMessage(
             conversation_id=conv_uuid, role="assistant", content=assistant_content
         ))
-
-        # Count current un-summarised messages (including the two just added)
-        count_result = await session.execute(
-            select(ConversationMessage)
-            .where(
-                ConversationMessage.conversation_id == conv_uuid,
-                ConversationMessage.summarised == False,  # noqa: E712
-            )
-            .order_by(ConversationMessage.created_at)
-        )
-        all_unsummarised = count_result.scalars().all()
-
-        if len(all_unsummarised) >= SUMMARISE_AFTER:
-            # Summarise the oldest SUMMARISE_BATCH messages
-            to_summarise = all_unsummarised[:SUMMARISE_BATCH]
-            new_summary = await _summarise_messages(to_summarise, user_id)
-
-            if new_summary:
-                # Fetch current rolling_summary to chain it
-                conv_result = await session.execute(
-                    select(Conversation).where(Conversation.id == conv_uuid)
-                )
-                conv = conv_result.scalar_one()
-                old_summary = conv.rolling_summary
-
-                combined = (
-                    f"{old_summary} {new_summary}".strip()
-                    if old_summary
-                    else new_summary
-                )
-                # Trim to 400 chars so it never grows unbounded
-                if len(combined) > 400:
-                    combined = combined[-400:]
-
-                await session.execute(
-                    update(Conversation)
-                    .where(Conversation.id == conv_uuid)
-                    .values(rolling_summary=combined)
-                )
-
-                # Mark summarised rows
-                ids_to_mark = [m.id for m in to_summarise]
-                await session.execute(
-                    update(ConversationMessage)
-                    .where(ConversationMessage.id.in_(ids_to_mark))
-                    .values(summarised=True)
-                )
-                logger.info(
-                    "Conversation summarised %d messages for user_id=%s — summary: %r",
-                    len(to_summarise), user_id, combined[:80],
-                )
-
         await session.commit()
         logger.debug("Turn saved to DB — conversation_id=%s", conversation_id)
+
+        result = await session.execute(
+            select(ConversationMessage)
+            .where(
+                col(ConversationMessage.conversation_id) == conv_uuid,
+                col(ConversationMessage.summarised) == False,  # noqa: E712
+            )
+            .order_by(col(ConversationMessage.created_at))
+        )
+        unsummarised = list(result.scalars().all())
+        await session.commit()
+
+    if len(unsummarised) < SUMMARISE_AFTER:
+        return
+
+    # 2. Summarise with no transaction open.
+    to_summarise = unsummarised[:SUMMARISE_BATCH]
+    new_summary = await _summarise_messages(to_summarise, user_id)
+    if not new_summary:
+        return
+
+    # 3. Claim the batch and append the summary atomically.
+    ids = [m.id for m in to_summarise]
+    async with AsyncSessionLocal() as session:
+        claimed = await session.execute(
+            update(ConversationMessage)
+            .where(
+                col(ConversationMessage.id).in_(ids),
+                col(ConversationMessage.summarised) == False,  # noqa: E712
+            )
+            .values(summarised=True)
+            .returning(col(ConversationMessage.id))
+        )
+        if len(claimed.all()) != len(ids):
+            await session.rollback()
+            logger.info(
+                "Summary batch already claimed by a concurrent turn — "
+                "discarding duplicate summary for user_id=%s", user_id,
+            )
+            return
+
+        conv = (
+            await session.execute(
+                select(Conversation).where(col(Conversation.id) == conv_uuid).with_for_update()
+            )
+        ).scalar_one()
+        combined = _append_summary(conv.rolling_summary, new_summary)
+        await session.execute(
+            update(Conversation)
+            .where(col(Conversation.id) == conv_uuid)
+            .values(rolling_summary=combined)
+        )
+        await session.commit()
+        logger.info(
+            "Conversation summarised %d messages for user_id=%s — summary: %r",
+            len(ids), user_id, combined[:80],
+        )
+
+
+def _append_summary(old: str | None, new: str) -> str:
+    """Chain a new summary sentence onto the rolling summary.
+
+    Args:
+        old: The current rolling summary, if any.
+        new: The new summary sentence.
+
+    Returns:
+        The combined summary, trimmed from the front to ``SUMMARY_MAX_CHARS``.
+    """
+    combined = f"{old} {new}".strip() if old else new
+    return combined[-SUMMARY_MAX_CHARS:]
 
 
 # ── In-memory fallback implementation ────────────────────────────────────────
@@ -258,7 +304,7 @@ def _mem_get(user_id: uuid.UUID) -> ConversationContext:
         {"role": m.role, "content": m.content}
         for m in store["messages"]
         if not m.summarised
-    ][-LIVE_WINDOW:]
+    ][-CONTEXT_WINDOW:]
     return ConversationContext(
         conversation_id=store["conv_id"],
         rolling_summary=store["summary"],
@@ -278,18 +324,10 @@ def _mem_save_turn(user_id: uuid.UUID, user_content: str, assistant_content: str
         snippets = "; ".join(
             m.content[:60] for m in to_summarise if m.role == "user"
         )
-        store["summary"] = (
-            f"{store['summary']} {snippets}".strip()
-            if store["summary"]
-            else snippets
-        )
-        if len(store["summary"]) > 400:
-            store["summary"] = store["summary"][-400:]
-        # Mark as summarised
-        store["messages"] = [
-            _MemTurn(m.role, m.content, True) if m in to_summarise else m
-            for m in store["messages"]
-        ]
+        store["summary"] = _append_summary(store["summary"], snippets)
+        # Summarised turns are only needed for the summary — drop them so the
+        # fallback store doesn't grow without bound.
+        store["messages"] = unsummarised[SUMMARISE_BATCH:]
 
 
 # ── LLM summarisation helper ──────────────────────────────────────────────────

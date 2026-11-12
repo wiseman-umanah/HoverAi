@@ -1,6 +1,7 @@
 """Tests for POST /api/v1/auth/ routes — signup, signin, refresh, signout."""
 
 import httpx
+import pytest
 
 
 class TestSignup:
@@ -364,3 +365,39 @@ class TestRefreshRotation:
         )
         assert me.status_code == 200
         assert me.json()["email"] == "access@example.com"
+
+
+class TestUserUpdateValidation:
+    """B13: PATCH /users/me and /users/me/settings reject out-of-range values."""
+
+    async def test_unknown_language_is_rejected(self, client, auth_headers):
+        """Only codes from LANGUAGE_MAP are accepted."""
+        resp = await client.patch(
+            "/api/v1/users/me", json={"language": "klingon"}, headers=auth_headers
+        )
+        assert resp.status_code == 422
+        resp = await client.patch("/api/v1/users/me", json={"language": "yo"}, headers=auth_headers)
+        assert resp.status_code == 200
+        assert resp.json()["language"] == "yo"
+
+    async def test_signup_unknown_language_is_rejected(self, client):
+        """Signup validates the language code too."""
+        resp = await client.post(
+            "/api/v1/auth/signup",
+            json={
+                "email": "lang@example.com",
+                "full_name": "Lang",
+                "password": "strongpassword1",
+                "language": "klingon",
+            },
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.parametrize(
+        "body",
+        [{"overlay_opacity": 0.1}, {"overlay_opacity": 1.5}, {"mic_sensitivity": 0}, {"mic_sensitivity": 11}],
+    )
+    async def test_settings_out_of_range_rejected(self, client, auth_headers, body):
+        """Opacity is 0.4–1.0 and mic sensitivity 1–10."""
+        resp = await client.patch("/api/v1/users/me/settings", json=body, headers=auth_headers)
+        assert resp.status_code == 422

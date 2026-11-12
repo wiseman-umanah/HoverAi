@@ -138,3 +138,15 @@ class TestConvertToWav:
         with pytest.raises(AudioConversionError, match="timed out"):
             await convert_to_wav(b"\x1aE\xdf\xa3 fake webm")
         assert killed == [True]
+
+
+async def test_sahara_stream_pcm_from_target_wav_skips_ffmpeg(monkeypatch):
+    """B22: v2 WAV uploads become raw PCM without spawning ffmpeg."""
+    from app.services.sahara_stt_stream import _to_pcm16
+
+    async def _no_spawn(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("ffmpeg must not run for 16 kHz mono WAV")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _no_spawn)
+    pcm = await _to_pcm16(_make_wav_bytes(sample_rate=16000, channels=1, duration_ms=100))
+    assert len(pcm) == 1600 * 2

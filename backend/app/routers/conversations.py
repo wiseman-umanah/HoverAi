@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
+from sqlmodel import col, select
 
 from app.auth import get_current_user
 from app.db import get_session
@@ -110,7 +110,7 @@ async def get_history(
             ConversationMessage.conversation_id == conv.id,
             ConversationMessage.summarised == False,  # noqa: E712
         )
-        .order_by(ConversationMessage.created_at)
+        .order_by(col(ConversationMessage.created_at))
     )
     messages = msgs_result.scalars().all()
 

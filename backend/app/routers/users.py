@@ -11,7 +11,12 @@ from sqlmodel import select
 from app.auth import get_current_user
 from app.db import get_session
 from app.models.models import User, UserSettings
-from app.schemas.users import UserResponse, UserSettingsResponse, UserSettingsUpdate
+from app.schemas.users import (
+    LanguageCode,
+    UserResponse,
+    UserSettingsResponse,
+    UserSettingsUpdate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +31,7 @@ class UserProfileUpdate(BaseModel):
             Controls STT language hint, vision response language, and TTS voice.
     """
 
-    language: Optional[str] = None
+    language: Optional[LanguageCode] = None
 
 
 @router.get("/me", response_model=UserResponse)

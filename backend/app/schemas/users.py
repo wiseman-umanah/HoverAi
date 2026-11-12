@@ -1,8 +1,31 @@
 """User and settings schemas."""
 
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, EmailStr
+from pydantic import AfterValidator, BaseModel, ConfigDict, EmailStr, Field
+
+from app.services.stt import LANGUAGE_MAP
+
+
+def _known_language(value: str) -> str:
+    """Reject language codes the STT/vision/TTS maps don't know (B13).
+
+    Args:
+        value: The submitted Hover language code.
+
+    Returns:
+        The unchanged code.
+
+    Raises:
+        ValueError: If the code is not in ``LANGUAGE_MAP`` (→ 422).
+    """
+    if value not in LANGUAGE_MAP:
+        raise ValueError(f"Unsupported language: {value!r}.")
+    return value
+
+
+# A Hover language code accepted by every provider map (see routers/languages.py).
+LanguageCode = Annotated[str, AfterValidator(_known_language)]
 
 
 class UserResponse(BaseModel):
@@ -77,9 +100,9 @@ class UserSettingsUpdate(BaseModel):
         voice_gender: Preferred AI voice gender — ``"female"`` or ``"male"``.
     """
 
-    overlay_opacity: Optional[float] = None
+    overlay_opacity: Optional[float] = Field(default=None, ge=0.4, le=1.0)
     overlay_size: Optional[Literal["compact", "default", "large"]] = None
-    mic_sensitivity: Optional[int] = None
+    mic_sensitivity: Optional[int] = Field(default=None, ge=1, le=10)
     sound_effects: Optional[bool] = None
     notifications: Optional[bool] = None
     wake_word_enabled: Optional[bool] = None

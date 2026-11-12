@@ -2,6 +2,8 @@
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
+from app.schemas.users import LanguageCode
+
 # bcrypt hashes only the first 72 bytes and bcrypt>=5 raises beyond that (B3).
 # Multibyte characters mean 72 *characters* can exceed this, so check bytes.
 _MAX_PASSWORD_BYTES = 72
@@ -23,7 +25,7 @@ class SignupRequest(BaseModel):
     email: EmailStr
     full_name: str = Field(min_length=1, max_length=120)
     password: str = Field(min_length=8, max_length=128)
-    language: str = "en-pidgin"
+    language: LanguageCode = "en-pidgin"
     device_id: str | None = None
 
     @field_validator("password")
