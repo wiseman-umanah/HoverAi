@@ -28,6 +28,8 @@ pub enum CoordSpace {
     Screen,
     /// Relative to the focused window's top-left (AT-SPI on Wayland, where
     /// apps don't know their global position). Caller adds the window origin.
+    /// Only produced by the Linux backend.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     WindowRelative,
 }
 

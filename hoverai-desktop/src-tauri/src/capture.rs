@@ -15,7 +15,7 @@
 
 use std::io::Cursor;
 
-use xcap::image::{self, imageops::FilterType, DynamicImage, ImageFormat, RgbaImage};
+use xcap::image::{self, imageops::FilterType, DynamicImage, RgbaImage};
 use xcap::Monitor;
 
 use crate::context::{self, Frame, MonitorGeometry, ScreenContext};
@@ -111,7 +111,7 @@ fn grim_fallback() -> Option<RgbaImage> {
         return None;
     }
     log::info!("[capture] used grim fallback");
-    image::load_from_memory_with_format(&out.stdout, ImageFormat::Png)
+    image::load_from_memory_with_format(&out.stdout, image::ImageFormat::Png)
         .ok()
         .map(|i| i.into_rgba8())
 }
@@ -142,6 +142,7 @@ fn encode_jpeg(rgba: RgbaImage) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xcap::image::ImageFormat;
 
     #[test]
     fn large_capture_is_downscaled_to_max_edge() {
