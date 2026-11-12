@@ -234,6 +234,23 @@ export function closeMainWindow(): void {
   getCurrentWebviewWindow().hide().catch(console.error)
 }
 
+// ─── API transport ───────────────────────────────────────────────────────────
+
+export interface ApiFetchResponse {
+  status: number
+  body: string
+}
+
+/** Send an API request from Rust (see `api_fetch` in lib.rs); `path` is relative to the API base. */
+export function apiFetch(
+  method: string,
+  path: string,
+  headers: Record<string, string>,
+  body: string | null,
+): Promise<ApiFetchResponse> {
+  return invoke<ApiFetchResponse>('api_fetch', { method, path, headers, body })
+}
+
 // ─── Updates (tauri-plugin-updater, driven from Rust — see updater.rs) ───────
 
 export interface UpdateInfo {
@@ -309,6 +326,7 @@ const tauriApi = {
   signOut,
   quitApp,
   closeMainWindow,
+  apiFetch,
   appVersion,
   checkForUpdate,
   installUpdate,

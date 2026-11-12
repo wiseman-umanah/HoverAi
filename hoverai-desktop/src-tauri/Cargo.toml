@@ -5,6 +5,11 @@ description = "HoverAI — AI-powered on-screen assistant"
 authors = ["HoverAI"]
 edition = "2021"
 
+[features]
+# Web inspector (right-click → Inspect) in release builds. Only for test builds
+# (package.yml); tagged releases are built without it.
+devtools = ["tauri/devtools"]
+
 [lib]
 name = "hoverai_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]

@@ -108,9 +108,6 @@ async function request<T>(
   const headers: Record<string, string> = {
     ...(fetchOptions.headers as Record<string, string>),
   }
-  // ngrok's free tier answers browser-like requests (the webview's fetch) with
-  // an HTML warning page unless this header is present.
-  if (API_BASE.includes('.ngrok')) headers['ngrok-skip-browser-warning'] = '1'
 
   let token: string | null = null
   if (!skipAuth) {
@@ -118,7 +115,7 @@ async function request<T>(
     if (token) headers['Authorization'] = `Bearer ${token}`
   }
 
-  const resp = await fetch(`${API_BASE}${path}`, { ...fetchOptions, headers })
+  const resp = await send(path, fetchOptions, headers)
 
   // ── 401 → refresh → retry once ───────────────────────────────────────────
   if (resp.status === 401 && !skipAuth) {
@@ -126,7 +123,7 @@ async function request<T>(
     if (!refreshed) throw new AuthExpiredError()
 
     const retryHeaders = { ...headers, Authorization: `Bearer ${refreshed}` }
-    const retry = await fetch(`${API_BASE}${path}`, { ...fetchOptions, headers: retryHeaders })
+    const retry = await send(path, fetchOptions, retryHeaders)
 
     if (retry.status === 401) {
       await window.api.clearTokens()
@@ -137,6 +134,31 @@ async function request<T>(
   }
 
   return parseResponse<T>(resp)
+}
+
+/**
+ * Send a request through Rust (`api_fetch`), not the webview's fetch: WebView2
+ * runs SmartScreen on every URL and blocks e.g. free ngrok domains, and the CSP
+ * and CORS rules don't apply to Rust. Returns a normal `Response` so the
+ * refresh/parse logic below is unchanged. Network failures become a readable
+ * ApiError naming the server.
+ */
+async function send(
+  path: string,
+  init: RequestInit,
+  headers: Record<string, string>,
+): Promise<Response> {
+  let res: { status: number; body: string }
+  try {
+    const body = typeof init.body === 'string' ? init.body : null
+    res = await window.api.apiFetch(init.method ?? 'GET', path, headers, body)
+  } catch (err) {
+    console.error('[api] request failed', path, err)
+    throw new ApiError(0, `Can't reach the HoverAI server at ${API_BASE}. Check your connection and that the server is running.`)
+  }
+  // Statuses like 204 must not carry a body in the Response constructor.
+  const noBody = res.status === 204 || res.status === 205 || res.status === 304
+  return new Response(noBody ? null : res.body, { status: res.status })
 }
 
 async function parseResponse<T>(resp: Response): Promise<T> {

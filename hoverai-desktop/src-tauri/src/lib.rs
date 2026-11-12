@@ -620,6 +620,7 @@ async fn get_access_token(app: AppHandle) -> Option<String> {
 #[tauri::command]
 fn clear_tokens(app: AppHandle) {
     tokens::clear(&app);
+    sync_tray_visibility(&app);
 }
 
 /// Called by the renderer after a 401. `stale` is the token that was rejected.
@@ -627,6 +628,54 @@ fn clear_tokens(app: AppHandle) {
 async fn refresh_tokens(app: AppHandle, stale: Option<String>) -> Option<String> {
     let client = state(&app).http.clone();
     auth::refresh(&app, &client, stale.as_deref()).await.ok()
+}
+
+/// Response of `api_fetch`, rebuilt into a `Response` by `src/lib/api.ts`.
+#[derive(Serialize)]
+struct ApiFetchResponse {
+    status: u16,
+    body: String,
+}
+
+/// HTTP transport for the renderer's API client (`src/lib/api.ts`).
+///
+/// The webview's own `fetch` is subject to the CSP, CORS and — on Windows —
+/// WebView2's SmartScreen check, which blocks free ngrok domains outright
+/// ("Failed to fetch" with nothing reaching the server). Requests sent from
+/// Rust have none of those problems, so all renderer API calls go through here.
+/// Only paths on `api_base()` are allowed, so this can't reach other hosts.
+#[tauri::command]
+async fn api_fetch(
+    app: AppHandle,
+    method: String,
+    path: String,
+    headers: std::collections::HashMap<String, String>,
+    body: Option<String>,
+) -> Result<ApiFetchResponse, String> {
+    if !path.starts_with('/') || path.contains("://") {
+        return Err(format!("invalid API path: {path}"));
+    }
+    let method = reqwest::Method::from_bytes(method.to_uppercase().as_bytes())
+        .map_err(|_| format!("invalid HTTP method: {method}"))?;
+    let url = format!("{}{}", api_base(), path);
+    let mut req = state(&app).http.request(method, &url);
+    for (k, v) in &headers {
+        req = req.header(k, v);
+    }
+    if api_base().contains(".ngrok") {
+        // ngrok's free tier otherwise may answer with an HTML warning page.
+        req = req.header("ngrok-skip-browser-warning", "1");
+    }
+    if let Some(b) = body {
+        req = req.body(b);
+    }
+    let resp = req.send().await.map_err(|e| {
+        log::warn!("[api] {url} failed: {e}");
+        e.to_string()
+    })?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    Ok(ApiFetchResponse { status, body })
 }
 
 #[tauri::command]
@@ -799,6 +848,8 @@ fn register_shortcut(app: AppHandle, key: String) -> bool {
         s.shortcut_key = key.clone();
         settings::save(&app, &s);
         bind_platform_shortcut(&app, &key);
+        // Onboarding is complete once a shortcut is chosen.
+        sync_tray_visibility(&app);
     }
     ok
 }
@@ -876,6 +927,7 @@ fn is_onboarded(app: &AppHandle) -> bool {
 fn end_session(app: &AppHandle, revoke: bool) {
     let refresh = tokens::get(app).map(|(_, r)| r);
     tokens::clear(app);
+    sync_tray_visibility(app);
     cancel_capture(app);
     unregister_active_shortcut(app);
     unbind_platform_shortcut();
@@ -999,6 +1051,7 @@ pub fn run() {
             clear_tokens,
             refresh_tokens,
             has_session,
+            api_fetch,
             // Settings
             get_settings,
             save_settings,
@@ -1073,6 +1126,15 @@ pub fn run() {
 
 // ─── Tray setup ───────────────────────────────────────────────────────────────
 
+const TRAY_ID: &str = "main";
+
+/// Show the tray icon only while onboarded (signed in + shortcut chosen).
+fn sync_tray_visibility(app: &AppHandle) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_visible(is_onboarded(app));
+    }
+}
+
 fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let settings_item = MenuItemBuilder::with_id("settings", "Settings").build(app)?;
     let quit_item = MenuItemBuilder::with_id("quit", "Quit HoverAI").build(app)?;
@@ -1093,7 +1155,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         tauri::image::Image::new_owned(img.into_raw(), w, h)
     };
 
-    let _tray = TrayIconBuilder::new()
+    let tray = TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
         .menu(&menu)
         .tooltip("HoverAI")
@@ -1119,6 +1181,9 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
         })
         .build(app)?;
+    // Only an onboarded app lives in the tray; before that, closing the
+    // onboarding window quits it.
+    let _ = tray.set_visible(is_onboarded(app.handle()));
 
     Ok(())
 }

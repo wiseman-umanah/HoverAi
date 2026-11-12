@@ -111,6 +111,7 @@ Declared in `src-tauri/tauri.conf.json`, built as a Vite multi-page app (`vite.c
 - `main` → `index.html` → `src/main.tsx` → `App.tsx`: onboarding wizard (`AuthPage` → `PermissionsPage` → `ShortcutPage`). Starts hidden (`visible: false`); Rust shows it at startup unless onboarded (= tokens stored **and** a shortcut chosen). Resumes at `permissions` if a session exists; resets to `auth` on the `signed-out` event.
 - `overlay` → `overlay.html` → `src/overlay.tsx` → `overlay/OverlayWidget.tsx`: transparent, undecorated, always-on-top, skip-taskbar, initially hidden. Moved/resized to the monitor under the cursor on each capture. **Pure view** — the session state lives in Rust (see below).
 - `settings` → `settings.html` → `src/settings.tsx` → `pages/SettingsPage.tsx`: opened from the tray (click or "Settings" menu item). Has a Quit button.
+The tray icon (`TRAY_ID`) is only visible while onboarded — `sync_tray_visibility` runs at startup, after `register_shortcut` and on sign-out / `clear_tokens`. Test builds from `package.yml` use the `devtools` Cargo feature (right-click → Inspect); releases don't.
 Window close: `main` before onboarding → **quits**; `overlay` → cancels the capture; otherwise hides. Quit (tray "Quit HoverAI", Settings → Quit, `quit_app`) unregisters shortcuts, stops audio, and force-exits after 2 s if teardown hangs.
 
 #### Rust side (`src-tauri/src/`)
@@ -130,6 +131,7 @@ Window close: `main` before onboarding → **quits**; `overlay` → cancels the 
 - Logs: `tauri-plugin-log` → stdout + the OS app log dir (`~/.local/share/com.hoverai.desktop/logs/hoverai.log` on Linux, `%LOCALAPPDATA%\com.hoverai.desktop\logs` on Windows). Use `log::info!/warn!/error!`, not `println!`.
 - Hardware smoke tests (no windows opened): `cargo test --lib -- --ignored --nocapture` (captures the screen, opens the mic, binds the Wayland portal shortcut, prints the a11y snapshot / screen context of the focused window, writes a marked screenshot to `/tmp/hoverai-marked.jpg`).
 - On this Hyprland 0.56 (Lua config) machine `hyprctl dispatch` takes Lua: `hyprctl dispatch 'hl.dsp.focus({ window = "address:0x…" })'`, `hyprctl dispatch 'hl.dsp.window.close()'` — the old `focuswindow class:…` form errors.
+- Linux CI/release jobs run on **ubuntu-24.04**: `xcap` → `pipewire`/`libspa` 0.10 generates bindings from the system PipeWire headers and fails to compile against 22.04's PipeWire 0.3.48. Consequence: Linux builds need glibc ≥ 2.39 (Ubuntu 24.04+, Debian 13+).
 - CI (`.github/workflows/ci.yml`): `desktop` (Ubuntu: tsc, `cargo clippy -D warnings`, unit tests) and `desktop-windows` (clippy) — keep clippy warning-free.
 
 #### IPC conventions
@@ -139,10 +141,10 @@ Window close: `main` before onboarding → **quits**; `overlay` → cancels the 
 - Capability permissions for window ops/plugins are in `src-tauri/capabilities/default.json` — a new window API call from JS needs its permission listed there.
 
 #### Backend API base URL is baked in at compile time
-`hoverai-desktop/.env` → `VITE_API_BASE=https://…/api/v1`. Vite injects it into the renderer (`import.meta.env.VITE_API_BASE`, used by `src/lib/api.ts`), and `src-tauri/build.rs` parses the same file and emits `cargo:rustc-env` so Rust reads it via `option_env!` (`api_base()` in `lib.rs`). Both default to `http://localhost:8000/api/v1`. Changing it requires restarting `pnpm tauri dev`. **The webview CSP (`tauri.conf.json` → `security.csp` → `connect-src`) only allows `localhost`, `*.onrender.com` and ngrok domains** — a new backend host must be added there or renderer `fetch` calls fail. For an ngrok base URL, `api.ts` adds `ngrok-skip-browser-warning` (the free tier otherwise returns an HTML interstitial to the webview's fetch).
+`hoverai-desktop/.env` → `VITE_API_BASE=https://…/api/v1`. Vite injects it into the renderer (`import.meta.env.VITE_API_BASE`, used by `src/lib/api.ts`), and `src-tauri/build.rs` parses the same file and emits `cargo:rustc-env` so Rust reads it via `option_env!` (`api_base()` in `lib.rs`). Both default to `http://localhost:8000/api/v1`. Changing it requires restarting `pnpm tauri dev`. **The webview CSP (`tauri.conf.json` → `security.csp` → `connect-src`) only allows `localhost`, `*.onrender.com` and ngrok domains** — a new backend host must be added there or renderer `fetch` calls fail. (Renderer API calls go through Rust `api_fetch`, so the CSP only matters for any direct webview fetch.) For an ngrok base URL, `api_fetch` adds `ngrok-skip-browser-warning` (the free tier can otherwise return an HTML warning page).
 
 #### Two HTTP clients
-- `src/lib/api.ts` — renderer `fetch` wrapper for auth/users/settings/history/languages. Gets a fresh token via `window.api.getAccessToken()` (Rust refreshes first if needed), on 401 calls `window.api.refreshTokens(rejectedToken)` (single-flight in Rust) and retries once; throws `ApiError` / `AuthExpiredError`.
+- `src/lib/api.ts` — renderer API client for auth/users/settings/history/languages. **It never uses the webview's `fetch`**: every request goes through the Rust command `api_fetch` (method + path relative to `api_base()` + headers + string body → `{status, body}`, rebuilt into a `Response`), because WebView2 runs SmartScreen on each URL and blocked free ngrok domains on Windows ("Failed to fetch", nothing reached the server); CSP/CORS don't apply either. Gets a fresh token via `window.api.getAccessToken()` (Rust refreshes first if needed), on 401 calls `window.api.refreshTokens(rejectedToken)` (single-flight in Rust) and retries once; throws `ApiError` / `AuthExpiredError`.
 - Rust (`reqwest`, rustls) — `/query`, `/auth/refresh`, `/auth/signout`, startup `/users/me` probe.
 
 #### Settings live in three places — keep them in sync
