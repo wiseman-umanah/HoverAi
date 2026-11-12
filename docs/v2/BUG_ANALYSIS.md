@@ -118,6 +118,8 @@ The top 6 items explain most of the "v1 is buggy" reports: queries failing on bi
 | D11 | `SettingsPage.tsx` → `save_settings` | Rust writes `shortcut_key`, but the renderer's copy is stale. The next toggle saves the whole struct and reverts the shortcut on restart | `save_settings` preserves `shortcut_key` (Rust owns it), or update local state |
 | D12 | `wake_word.rs`, `lib.rs` `apply_wake_word_setting` | The sensitivity threshold is read only at detector start. A detector that died leaves `Some(tx)`, so it can't be re-enabled. A cpal stream error just logs and the loop spins forever | Restart on sensitivity change, clear the slot when the thread exits, treat stream errors as fatal |
 | D13 *(plausible)* | `wake_word.rs:32` | The cooldown (1.5 s) is shorter than the time the phrase stays in the window (2 s + hop), so it can double-trigger. The second trigger *dismisses* the overlay the first opened | Cooldown ≥ 2.5 s, clear the window after a detection, ignore wake triggers while the overlay is visible |
+| D27 | `wake_word.rs` `sensitivity_to_threshold` | Comments say sensitivity 5 → 0.41 (the eval's optimal threshold) but the formula gives 0.48, so the default is stricter than intended | Choose the mapping from `wakeword/wake-test guided` results on real voices |
+| D28 | `lib.rs` `hide_overlay` (Linux) | App aborted at the end of onboarding: `launch_overlay` hid the never-shown overlay and called `set_ignore_cursor_events(true)`; tao 0.35 unwraps the missing GdkWindow inside a GTK callback → `panic_cannot_unwind` → SIGABRT | **Fixed 2026-11-01:** `hit_region::set_click_through` (guarded GDK input region on Linux) |
 | D14 | `lib.rs:635` `Client::new()` | No HTTP timeout, so a hung backend leaves the overlay "loading" forever | `Client::builder().timeout(60s)`, with a shorter timeout for the startup probe |
 | D15 | `SettingsPage.tsx` | Server settings are merged into the UI but never saved or applied locally. On a new machine the wake-word toggle shows ON while it's actually off | Persist and apply after the merge |
 | D16 *(plausible)* | `lib.rs` `trigger_capture` | `screenshots` `DisplayInfo` is in points on macOS but is used as a `PhysicalSize`, so on Retina the overlay covers a quarter of the screen | Use Tauri's `primary_monitor()` / `current_monitor()` sizes |
@@ -126,12 +128,12 @@ The top 6 items explain most of the "v1 is buggy" reports: queries failing on bi
 | D19 | `lib.rs` builder | No single-instance guard. A relaunch gives two tray icons, two wake-word detectors and shortcut conflicts | `tauri-plugin-single-instance` |
 | D20 | `http_client.rs:37` | The retry copies the original headers (including the old `Authorization`) and then `bearer_auth` **appends** a second one (confirmed in reqwest 0.12 `header_sensitive` → `append`). The server reads the stale token, so the startup probe clears tokens right after a successful refresh | Remove `AUTHORIZATION` from the copied headers |
 | B7 | `routers/query.py:93-109`, `services/stt.py` | WAV conversion failure → empty bytes sent to Whisper. Provider errors and rate limits are swallowed to `""` and all reported as 422 "empty transcript" | 400 on bad audio. Raise provider errors and map them to 502/503/429 |
-| B8 | `services/conversation.py:170,209` | Summarises at 12 messages, folding 8, but sends only the last 4. Up to 6 messages are in neither the summary nor the context | Send all unsummarised messages (≤10), or summarise once the count exceeds `LIVE_WINDOW` |
-| B9 | `services/conversation.py` `save_turn` | Concurrent turns can summarise the same rows twice. The LLM call runs inside an open transaction | Row lock / advisory lock; claim rows with `UPDATE … RETURNING`; call the LLM outside the transaction |
+| B8 | `services/conversation.py:170,209` | Summarises at 12 messages, folding 8, but sends only the last 4. Up to 6 messages are in neither the summary nor the context | Send all unsummarised messages (≤10), or summarise once the count exceeds `LIVE_WINDOW` — **Fixed 2026-10-31:** context now carries every unsummarised message (≤12). |
+| B9 | `services/conversation.py` `save_turn` | Concurrent turns can summarise the same rows twice. The LLM call runs inside an open transaction | Row lock / advisory lock; claim rows with `UPDATE … RETURNING`; call the LLM outside the transaction — **Fixed 2026-10-31:** LLM call outside any transaction; batch claimed with `UPDATE … AND NOT summarised RETURNING`, duplicate discarded. |
 | B10 | `services/sahara_tts.py`, `routers/query.py` TTS step | The default language (`en-pidgin`) always goes to Sahara. Worst case ≈65 s plus the Orpheus fallback, so a query can exceed 100 s | `asyncio.wait_for` with a total TTS budget (~8 s); tighter per-call timeouts |
-| B11 | `services/agent.py:303-306,535` | `float(None)` or an unknown `action` raises outside the `try` → 502 and a leaked session. Invalid JSON is never retried. `bool("false")` is `True` | Validate inside the `try`, retry on parse errors, strict bool coercion |
+| B11 | `services/agent.py:303-306,535` | `float(None)` or an unknown `action` raises outside the `try` → 502 and a leaked session. Invalid JSON is never retried. `bool("false")` is `True` | Validate inside the `try`, retry on parse errors, strict bool coercion — **Fixed 2026-10-31:** strict float/bool coercion, unknown action → corrective retry once, session dropped on failure. |
 | B12 | `routers/query.py:91`, `routers/agent.py:91` | Unbounded `audio.read()` | Cap the size (e.g. 10 MB); body limit at the proxy/middleware |
-| B13 | `schemas/users.py:80-82`, `PATCH /users/me` | No bounds on `overlay_opacity` / `mic_sensitivity`, and any `language` string is accepted | `Field(ge, le)`; validate against `LANGUAGE_MAP` |
+| B13 | `schemas/users.py:80-82`, `PATCH /users/me` | No bounds on `overlay_opacity` / `mic_sensitivity`, and any `language` string is accepted | `Field(ge, le)`; validate against `LANGUAGE_MAP` — **Fixed 2026-10-31:** `Field(ge, le)` on opacity/sensitivity; `LanguageCode` validated against `LANGUAGE_MAP` on PATCH /users/me and signup. |
 
 ## Low
 
@@ -153,7 +155,7 @@ Backend:
 - **B19:** `QueryLog.vision_response` / `beacon_steps` are typed `str` but store a dict/list.
 - **B20:** Agent sessions aren't bound to a user. `/agent/start` ignores the user's saved language.
 - **B21:** `/conversations/history` returns a random `conversation_id` when the user has none.
-- **B22:** The Sahara streaming STT's `subprocess.run(ffmpeg)` blocks and has no timeout (feature flag off by default).
+- **B22:** The Sahara streaming STT's `subprocess.run(ffmpeg)` blocks and has no timeout (feature flag off by default). **Fixed 2026-10-31:** uses the async, time-boxed `convert_to_wav` (WAV uploads skip ffmpeg).
 - **B23:** Migration filename collisions (`002_*` ×2, `003_*` ×2), so the apply order is ambiguous.
 
 Tests / tooling:

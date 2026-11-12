@@ -62,7 +62,6 @@ pnpm tauri dev
 
 Rust builds on 4 threads / 7.7 GB RAM:
 - Crates are downloaded **once** into `~/.cargo/registry` (~84 MB compressed, shared by all projects). `target/` is only compiled output; `cargo clean` costs a rebuild, not a re-download. To guarantee no network use, run with `CARGO_NET_OFFLINE=true`.
-- The wake word is behind the `wake-word` Cargo feature (off by default), which drops ~120 crates and the ONNX Runtime binary download. `pnpm dev:wake` builds with it.
 - `Cargo.toml` dev profile already strips debug info from dependencies, which makes `target/` several GB smaller.
 - Keep **debug** builds for daily work. Never run the LTO `release` profile locally (it is ~45 min even on faster machines).
 - If the machine swaps during builds, set `export CARGO_BUILD_JOBS=3`.

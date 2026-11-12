@@ -188,8 +188,7 @@ Not done / carried over:
   - D17 (`e.code`-based shortcut capture).
 - **Backend:**
   - Refresh-token family revocation on reuse (TODO).
-  - B8, B9, B11, B13, B22.
-  - `datetime.utcnow` deprecation in the models.
+  - ~~B8, B9, B11, B13, B22~~ and ~~`datetime.utcnow`~~ — fixed 2026-10-31 (see the bug table; tests in `test_conversation.py`, `test_agent_parser.py`, `test_auth_routes.py`, `test_audio.py`).
   - Docker image size (1.38 GB).
 - **Databases:** existing databases built by the old `create_all` were stamped `0001_baseline` but differ slightly: FKs without `ON DELETE`, `json` instead of `jsonb`, one missing index. Either recreate them (dev) or add a `0002` fix-up migration (production).
 
@@ -266,7 +265,24 @@ Not yet done (next increments):
 - **Linux:** AppImage + .deb from CI. Document X11 vs Wayland support. Officially support Hyprland/GNOME/KDE on Wayland via portals.
 - Release workflow: drop `macos-13`; cache Rust and pnpm; release profile only on tags, `release-fast` for PR artifacts.
 
+#### Phase 4 status (2026-10-31): CI part written, not yet run on GitHub
+
+Done (uncommitted; takes effect once pushed):
+- `package.yml`: PR/manual installers as artifacts with `release-fast` — Windows NSIS + MSI, macOS `universal-apple-darwin` DMG, Linux AppImage + deb.
+- `release.yml`: `macos-13` dropped (universal build on `macos-latest`), pnpm store cached, per-target Rust cache, `patchelf`/`libfuse2` for AppImage, fails if `VITE_API_BASE` is missing.
+- Empty `VITE_API_BASE` now falls back to localhost in both Rust and the renderer (was an empty base URL).
+- `hoverai-desktop/README.md`: CI table, how to test a PR build, Linux X11 vs Wayland table. Both workflows pass `actionlint`.
+
+Open:
+- First real run of both workflows (needs the user to push); fix whatever the runners surface.
+- Install + smoke-test the Windows artifact in a Windows VM (first ever run of the UIA code); find a Mac tester.
+- macOS Accessibility permission flow (blocked on macOS AX, which is still a stub).
+- Code signing (Windows SmartScreen, macOS notarisation) — optional, needs certificates.
+- GNOME/KDE Wayland and X11 sessions untested.
+
 ### Phase 5: Wake word iteration, then agentic
+
+> **Status 2026-11-01:** the wake word was **removed from the desktop app**. On the user's own voice (`wakeword/wake-test guided`, 12 prompts) the model caught 1/12 at the default setting and 6/12 at the most sensitive one, with no false alarms. It was trained only on synthetic US-English voices. The training dir and test harness stay in `wakeword/`; the old app code is in git at `3d80d86`. Phase 5 continues with the agentic track (5b).
 - **Wake word:**
   - an offline evaluation harness (WAV fixtures → expected detections),
   - fix D12/D13,
