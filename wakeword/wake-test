@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Run test_model.py with a working Python 3.12, reusing the training venv's
+# packages (its own python symlink may point at a Python that no longer exists).
+# No installs, no downloads. Usage: ./wake-test guided | live | files PATH...
+DIR="$(cd "$(dirname "$0")" && pwd)"
+for PY in "$DIR/.venv/bin/python" "$DIR/../backend/.venv/bin/python" "$(command -v python3.12)"; do
+  if [ -n "$PY" ] && "$PY" -c 'import sys; sys.exit(sys.version_info[:2] != (3, 12))' 2>/dev/null; then
+    exec "$PY" -I "$DIR/test_model.py" "$@"
+  fi
+done
+echo "Need a Python 3.12 (e.g. run 'uv sync' in backend/ once)." >&2
+exit 1

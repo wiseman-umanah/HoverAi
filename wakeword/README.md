@@ -111,3 +111,26 @@ uv run livekit-wakeword --help
 Individual stages are also available through the CLI, but this repository's
 `main.py` is the reproducible pipeline because it keeps the model name,
 phrase, sample count, and training steps in one place.
+
+## Test the model on your own voice (no training setup needed)
+
+`test_model.py` replays the detector the desktop app used (removed from the app on 2026-11-01; code in git at `3d80d86`) exactly (2 s window scored
+every 500 ms, 1.5 s cooldown, threshold from the 1–10 sensitivity slider)
+against your microphone or WAV files. It reuses the packages already in
+`.venv` with any Python 3.12 (the `./wake-test` wrapper finds one), so it needs
+no compiling and no downloads. The mel/embedding models are byte-identical to
+the ones in the Rust crate, so results carry over to the app.
+
+```bash
+wpctl set-mute @DEFAULT_AUDIO_SOURCE@ 0   # make sure the mic isn't muted
+./wake-test guided          # ~2 min: prompts you 12×, then quiet + normal talk
+./wake-test live            # free-form; shows the score live, Ctrl+C to stop
+./wake-test files sessions/<id>/audio.wav     # re-score a saved session
+./wake-test files positives negatives         # folders of WAV clips
+```
+
+`guided` prints a table of hits / false alarms / double triggers for every
+sensitivity value. Each session is saved under `sessions/<timestamp>/`
+(`audio.wav`, `scores.csv`, `detections.csv`, `summary.json`; git-ignored).
+Record extra clips with
+`pw-record --rate 16000 --channels 1 --format s16 clip.wav`.

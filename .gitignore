@@ -30,3 +30,6 @@ __pycache__
 .env
 data
 output
+
+# Wake-word test recordings (your voice) — see wakeword/test_model.py
+wakeword/sessions/
